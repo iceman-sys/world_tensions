@@ -105,8 +105,66 @@ constraints relax step by step, so every resource always gets a site.
 - **Renderer:** the view borrows the globe's renderer. The globe is suspended, so only one loop runs.
 - **Exit:** disposes every geometry, material, texture, instanced mesh and the shadow map. The e2e test checks that GPU memory stays flat over repeated enter/exit cycles.
 
+## Buildings (`shared/country/buildings.ts`)
+
+| Building | Cost | Build time (game h) | Upkeep $/game h | Jobs | Homes | Food/h | Service | Satisfaction | Footprint | Max relief |
+|---|---|---|---|---|---|---|---|---|---|---|
+| House | $800,000 | 6 | 400 | 0 | 6 | — | — | +0.5 | 2×2 | 1.6 |
+| Apartment | $3,000,000 | 18 | 1,500 | 2 | 24 | — | — | 0 | 3×3 | 1.4 |
+| Farm | $2,500,000 | 12 | 900 | 8 | 1 | 30 | — | 0 | 6×5 | 2.2 |
+| Mine | $6,000,000 | 24 | 2,400 | 18 | 0 | — | — | −0.5 | 4×4 | 4 |
+| School | $5,000,000 | 24 | 2,000 | 6 | 0 | — | education 60 | +1.5 | 4×3 | 1.4 |
+| Market | $4,000,000 | 12 | 1,200 | 10 | 0 | 4 | capacity 80 | +1 | 4×4 | 1.4 |
+| Clinic | $6,000,000 | 24 | 2,600 | 8 | 0 | — | health 50 | +2 | 3×3 | 1.4 |
+| Park | $1,500,000 | 6 | 300 | 1 | 0 | — | leisure 60 | +1.5 | 5×5 | 2.5 |
+| Police Station | $4,500,000 | 18 | 1,800 | 7 | 0 | — | safety 70 | +0.5 | 3×3 | 1.4 |
+| Town Hall | (founded with the country) | — | 1,000 | 6 | 0 | — | seat of government | 0 | 5×4 | 2 |
+
+**Construction time.** Real time = `buildHours × constructionFactor × (3,600,000 /
+timeScale)` ms.
+- Normal mode: `constructionFactor` 1, so a school takes 24 real hours.
+- `DEMO_MODE`: `constructionFactor` 0.05 and time scale 60, so a school takes **72 s** and a house **18 s**.
+- `CONSTRUCTION_FACTOR` overrides it.
+
+**Placement rules** (`validatePlacement`, used by the ghost preview *and* the
+server). Buildings snap to the terrain's tile grid; rotation 0/90° swaps the
+footprint. The first failing rule is reported:
+
+1. Known, buildable kind.
+2. The footprint lies inside the map.
+3. Every footprint tile is **own territory** (not channel, neighbour or sea).
+4. No footprint tile is **water** (lake, river).
+5. Ground relief across the footprint ≤ the kind's **max relief** (no steep slopes).
+6. No **overlap**: one tile of street clearance is kept around every building.
+7. Not **locked**: satisfaction ≤ 20 % (the uprising) halts construction.
+8. The treasury covers the **cost**.
+
+**Server execution.** `Game.build` runs on the action queue:
+- It brings the treasury up to date and validates against the server's own copy of the terrain (same generator, same input).
+- It deducts the cost and creates the construction (`status: building`, `completesAt`).
+- It writes an audit row with the governor's name.
+- The tick completes the construction, sends an inbox message and writes an audit row.
+
+Cancelling a construction in progress refunds **75 %**.
+
+**Starter town.** A new country is founded with a Town Hall at the capital, a
+market, five houses, a farm and a park. Each takes the nearest valid spot in a
+spiral around the capital (farms at least 8 tiles out). The layout is deterministic.
+
+**Rendering.**
+- Each kind is one procedural low-poly model, merged into a body geometry (vertex colours) plus a window geometry, so each kind is two instanced draw calls.
+- Construction sites grow from the ground with a scaffold and an HTML progress ring.
+- Trees under or next to buildings are hidden.
+
 ## Server authority
 
 Terrain derives only from public data (the Earth seed), the same as the globe, so
-the client generates it locally. Buildings, citizens and statistics are private;
-see the later sections.
+the client generates it locally.
+
+**Buildings are private.**
+- `local:open` subscribes a socket to **its own nation's** data. Country-view messages have no nation-id field, and the validator rejects extra fields.
+- `local:state` and `local:diff` go only to sockets whose governor holds that nation. The nation is looked up on every send, so a governor who loses the country stops receiving immediately.
+- Cancelling another nation's building answers exactly like a missing one ("No such construction site.").
+
+Tests: `tests/authorization.test.ts` (real WebSocket clients against
+`createGameServer`) and `tests/buildings.test.ts`.

@@ -5,6 +5,7 @@
  * adapter would implement the same interface (see README, "Path to production").
  */
 import type { AuditEntry, InboxItem, LogEntry, Nation, PlayerRec, SessionRec } from '../../../shared/model.ts';
+import type { Building } from '../../../shared/country/buildings.ts';
 
 export interface ChangeSet {
   meta?: Record<string, string>;
@@ -20,6 +21,8 @@ export interface ChangeSet {
   log?: LogEntry[];
   audit?: AuditEntry[];
   inbox?: InboxItem[];
+  buildings?: Building[];
+  deleteBuildings?: number[];
 }
 
 export interface WorldSnapshot {
@@ -33,6 +36,7 @@ export interface WorldSnapshot {
   log: LogEntry[];
   /** most recent inbox items per player, oldest first */
   inbox: InboxItem[];
+  buildings: Building[];
 }
 
 export interface Repository {

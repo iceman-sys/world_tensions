@@ -35,6 +35,7 @@ export async function openGame(opts: {
   seed?: number;
   rngSeed?: number;
   legacy?: PersistedState | null;
+  terrainSize?: number;
 }): Promise<{ game: Game; repo: SqliteRepository; clock: FakeClock }> {
   const clock = opts.clock ?? new FakeClock();
   const repo = new SqliteRepository(opts.file ?? ':memory:');
@@ -55,6 +56,7 @@ export async function openGame(opts: {
         return g;
       },
       metaSamples: 6000,
+      terrainSize: opts.terrainSize ?? 96,
     },
     { seed: opts.seed ?? 0x1234abcd, legacy: opts.legacy ?? null },
   );

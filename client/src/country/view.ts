@@ -4,7 +4,10 @@ import { MASK } from '../../../shared/country/config.ts';
 import { tileToWorld, type LocalTerrain } from '../../../shared/country/terrain.ts';
 import { buildDepthTexture, buildTerrainMesh } from './terrainMesh.ts';
 import { buildWater, type WaterUniforms } from './water.ts';
-import { Disposables, buildFlagpole, buildResourceSites, buildTrees, heightAt } from './props.ts';
+import { Disposables, buildFlagpole, buildResourceSites, buildTrees, heightAt, type Trees } from './props.ts';
+import { BuildingLayer, placementTransform } from './buildingLayer.ts';
+import { Placement, type PlacementHint } from './placement.ts';
+import { footprint, validatePlacement, type Building, type BuildingKind } from '../../../shared/country/buildings.ts';
 
 export interface CountryViewOptions {
   terrain: LocalTerrain;
@@ -12,6 +15,12 @@ export interface CountryViewOptions {
   name: string;
   flag: HTMLCanvasElement;
   neighborTint: (cell: number) => string | null;
+  /** server clock (construction progress) */
+  serverNow: () => number;
+  /** current treasury (placement preview) */
+  funds: () => number;
+  onPlace: (kind: BuildingKind, i: number, j: number, rot: 0 | 1) => void;
+  onHint: (hint: PlacementHint | null) => void;
 }
 
 export interface CountryStats {
@@ -55,6 +64,12 @@ export class CountryView {
   private lastT = performance.now();
   /** called each frame after rendering */
   onFrame: (() => void) | null = null;
+  private layer: BuildingLayer | null = null;
+  private trees: Trees | null = null;
+  placement: Placement | null = null;
+  private flagGroup: THREE.Group | null = null;
+  private capitalLabel: Label | null = null;
+  private serverNow: () => number = () => Date.now();
 
   constructor(private readonly renderer: THREE.WebGLRenderer, private readonly labelRoot: HTMLElement) {
     this.camera = new THREE.PerspectiveCamera(45, 1, 0.5, 1400);
@@ -98,19 +113,31 @@ export class CountryView {
     this.water = water.uniforms;
     this.scene.add(water.mesh);
 
-    this.scene.add(buildTrees(t, o.seed, this.d));
+    this.trees = buildTrees(t, o.seed, this.d);
+    this.scene.add(this.trees.group);
     const sites = buildResourceSites(t, this.d);
     this.scene.add(sites);
+
+    this.serverNow = o.serverNow;
+    this.layer = new BuildingLayer(t, this.d, this.labelRoot);
+    this.scene.add(this.layer.group);
+    this.placement = new Placement(t, this.layer, this.camera, this.renderer.domElement, o.funds, () => this.layer?.list() ?? [], this.d);
+    this.placement.onPlace = o.onPlace;
+    this.placement.onHint = o.onHint;
+    this.scene.add(this.placement.object);
 
     const cap = tileToWorld(n, t.capital.i, t.capital.j);
     const capY = heightAt(t, cap.x, cap.z);
     const flag = buildFlagpole(o.flag, this.d);
     flag.group.position.set(cap.x, capY - 0.1, cap.z);
+    flag.group.scale.setScalar(0.55);
     this.flagUpdate = flag.update;
+    this.flagGroup = flag.group;
     this.scene.add(flag.group);
 
     // labels: capital and resource sites
-    this.addLabel(`★ ${o.name}`, new THREE.Vector3(cap.x, capY + 10.5, cap.z), 'capital');
+    this.addLabel(`★ ${o.name}`, new THREE.Vector3(cap.x, capY + 7, cap.z), 'capital');
+    this.capitalLabel = this.labels[this.labels.length - 1] ?? null;
     for (const s of sites.children) {
       const r = s.userData.resource;
       if (typeof r === 'string') this.addLabel(r, new THREE.Vector3(s.position.x, s.position.y + 5.5, s.position.z), 'resource');
@@ -130,9 +157,59 @@ export class CountryView {
     this.sun.target.position.set((minX + maxX) / 2, 0, (minZ + maxZ) / 2);
     this.sun.position.copy(this.sun.target.position).addScaledVector(this.sunDir, n);
 
-    // start looking at the capital
-    this.camera.position.set(cap.x + 70, capY + 75, cap.z + 95);
+    // start looking at the capital, close enough to see the town
+    this.camera.position.set(cap.x + 30, capY + 34, cap.z + 42);
     this.cameraTarget.set(cap.x, capY, cap.z);
+  }
+
+  /** Shows the server's building list (full replace; cheap). */
+  setBuildings(list: Building[]): void {
+    if (!this.layer || !this.terrain) return;
+    this.layer.set(list, this.serverNow());
+    this.trees?.clear(this.layer.footprints());
+    this.placement?.refresh();
+    // the flag stands in front of the town hall
+    const hall = list.find((b) => b.kind === 'townhall');
+    if (hall && this.flagGroup) {
+      const tr = placementTransform(this.terrain, hall.kind, hall.i, hall.j, hall.rot);
+      const [, d] = footprint(hall.kind, hall.rot);
+      const z = tr.z + d / 2 + 1.2;
+      this.flagGroup.position.set(tr.x - 1.6, heightAt(this.terrain, tr.x - 1.6, z) - 0.1, z);
+      if (this.capitalLabel) this.capitalLabel.pos.set(tr.x, tr.y + 7, tr.z);
+    }
+  }
+
+  /**
+   * Test/dev hook: nearest spot to the capital where `kind` would be valid (or,
+   * with wantValid=false, an invalid one), in screen pixels.
+   */
+  findSpot(kind: BuildingKind, wantValid: boolean): { x: number; y: number; i: number; j: number } | null {
+    const t = this.terrain;
+    if (!t || !this.layer) return null;
+    const list = this.layer.list();
+    for (let r = 4; r < 60; r++) {
+      for (let dj = -r; dj <= r; dj++) {
+        for (let di = -r; di <= r; di++) {
+          if (Math.max(Math.abs(di), Math.abs(dj)) !== r) continue;
+          const i = t.capital.i + di, j = t.capital.j + dj;
+          const ok = validatePlacement(t, list, kind, i, j, 0, Infinity).ok;
+          if (ok !== wantValid) continue;
+          const tr = placementTransform(t, kind, i, j, 0);
+          this.tmp.set(tr.x, tr.y, tr.z).project(this.camera);
+          // stay clear of the HUD (top) and the build bar (bottom)
+          if (Math.abs(this.tmp.x) > 0.7 || Math.abs(this.tmp.y) > 0.55 || this.tmp.z > 1) continue;
+          const el = this.renderer.domElement;
+          const rect = el.getBoundingClientRect();
+          return { x: rect.left + (this.tmp.x * 0.5 + 0.5) * rect.width, y: rect.top + (-this.tmp.y * 0.5 + 0.5) * rect.height, i, j };
+        }
+      }
+    }
+    return null;
+  }
+
+  startPlacement(kind: BuildingKind | null): void {
+    if (kind) this.placement?.start(kind);
+    else this.placement?.cancel();
   }
 
   private readonly cameraTarget = new THREE.Vector3();
@@ -241,8 +318,11 @@ export class CountryView {
     }
     if (this.water) this.water.uTime.value = time;
     this.flagUpdate?.(time);
+    const serverNow = this.serverNow();
+    this.layer?.updateConstruction(serverNow);
     this.renderer.render(this.scene, this.camera);
     this.layoutLabels();
+    this.layer?.layoutRings(this.camera, this.renderer.domElement.clientWidth, this.renderer.domElement.clientHeight, serverNow);
     this.onFrame?.();
   };
 
@@ -299,6 +379,13 @@ export class CountryView {
     canvas.removeEventListener('webglcontextlost', this.contextLost);
     canvas.removeEventListener('webglcontextrestored', this.contextRestored);
     this.sun.shadow.dispose();
+    this.placement?.dispose();
+    this.placement = null;
+    this.layer?.dispose();
+    this.layer = null;
+    this.trees = null;
+    this.flagGroup = null;
+    this.capitalLabel = null;
     this.d.dispose();
     this.scene.clear();
     for (const l of this.labels) l.el.remove();

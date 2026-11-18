@@ -243,6 +243,64 @@ const SCENARIOS = {
     );
     await carla.close();
   },
+
+  /** Country View CV2: starter town, build menu, ghost preview, server-validated construction. */
+  async cv2() {
+    await startServer();
+    const dora = await profile('dora', [1280, 720]);
+    const page = await dora.open();
+    await joinViaUi(page, 'Dora');
+    const until = (fn, arg, timeout = 120000) => page.waitForFunction(fn, arg, { timeout, polling: 200 });
+    await page.evaluate(() => window.__wt.enterCountry());
+    await step('enter', () => until(() => window.__wt.country().inside && !window.__wt.country().busy));
+    await step('starter town arrives from the server', () => until(() => window.__wt.local().length >= 6));
+    const town = await page.evaluate(() => window.__wt.local().map((b) => b.kind));
+    check(town.includes('townhall') && town.includes('market') && town.includes('farm'), `starter town: ${town.join(', ')}`);
+    await page.evaluate(() => window.__wt.countryOrbit(25, 52, 46));
+    await shot(page, 'cv2-01-starter-town');
+
+    // build menu with a tooltip
+    await page.hover('.bm-item[data-kind="school"]');
+    await step('tooltip shows', () => page.waitForSelector('#build-tip:not([hidden])', { timeout: 20000 }));
+    const tip = await page.textContent('#build-tip');
+    check(/Cost \$5,000,000/.test(tip ?? '') && /education/.test(tip ?? ''), 'tooltip shows cost and effects');
+    await shot(page, 'cv2-02-build-menu');
+
+    // ghost preview: valid (green) then invalid (red)
+    await step('pick house', () => page.click('.bm-item[data-kind="house"]', { timeout: 20000 }));
+    const good = await page.evaluate(() => window.__wt.findBuildSpot('house', true));
+    const bad = await page.evaluate(() => window.__wt.findBuildSpot('house', false));
+    check(good && bad, 'found a valid and an invalid spot on screen');
+    await page.mouse.move(bad.x, bad.y);
+    await step('red ghost hint', () => page.waitForSelector('#build-hint.bad:not([hidden])', { timeout: 20000 }));
+    check(true, `invalid spot is refused in the preview: "${await page.textContent('#build-hint')}"`);
+    await shot(page, 'cv2-03-ghost-invalid');
+    await page.mouse.move(good.x, good.y);
+    await page.waitForTimeout(800);
+    console.log(`  hint at the valid spot (${good.i},${good.j}): "${await page.textContent('#build-hint')}"`);
+    await page.waitForSelector('#build-hint:not(.bad):not([hidden])', { timeout: 15000 });
+    await shot(page, 'cv2-04-ghost-valid');
+
+    // place it: the server validates, charges and starts the construction
+    const before = await page.evaluate(() => window.__wt.net().nations.find((n) => n.id === window.__wt.net().you?.nationId)?.funds);
+    await page.mouse.down();
+    await page.mouse.up();
+    try {
+      await until(() => window.__wt.local().some((b) => b.kind === 'house' && b.status === 'building'), null, 30000);
+    } catch (e) {
+      const toast = await page.evaluate(() => (document.getElementById('toast')?.hidden ? '(none)' : document.getElementById('toast')?.textContent));
+      const placing = await page.evaluate(() => document.getElementById('build-hint')?.textContent);
+      throw new Error(`no construction started; toast: ${toast}; hint: ${placing}; ${e.message.split('\n')[0]}`);
+    }
+    check(true, 'server started the construction');
+    await until((f) => window.__wt.net().nations.find((n) => n.id === window.__wt.net().you?.nationId)?.funds < f, before);
+    check(true, 'treasury charged by the server');
+    await page.waitForTimeout(4000);
+    await shot(page, 'cv2-05-under-construction');
+    await step('construction completes', () => until(() => !window.__wt.local().some((b) => b.status === 'building'), null, 90000));
+    await shot(page, 'cv2-06-completed');
+    await dora.close();
+  },
 };
 
 const wanted = process.argv[2];

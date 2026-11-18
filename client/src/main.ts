@@ -8,6 +8,7 @@ import { $, escapeHtml, formatArea, formatDuration, formatInt, formatMoney, form
 import { renderAwaySummary } from './ui/away.ts';
 import { CountryController } from './country/controller.ts';
 import type { CountryStats } from './country/view.ts';
+import type { Building, BuildingKind } from '../../shared/country/buildings.ts';
 import { deriveSeed, formatSeed, mulberry32, parseSeed, randomSeed } from '../../shared/rng.ts';
 import { DEFAULT_FACE_SIZE } from '../../shared/cube.ts';
 import { isValidName, normalizeName, NAME_MAX, NAME_MIN, type CountryState, type NationView, type You } from '../../shared/protocol.ts';
@@ -33,6 +34,9 @@ declare global {
       exitCountry: () => Promise<void>;
       country: () => { inside: boolean; busy: boolean; stats: CountryStats | null };
       countryOrbit: (azimuth: number, polar: number, dist: number) => void;
+      pickBuilding: (kind: BuildingKind | null) => void;
+      findBuildSpot: (kind: BuildingKind, valid: boolean) => { x: number; y: number; i: number; j: number } | null;
+      local: () => Building[];
       memory: () => { geometries: number; textures: number; programs: number };
       globeDistance: () => number;
     };
@@ -553,6 +557,7 @@ window.addEventListener('keydown', (e) => {
   if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || joinDialog.open)) return;
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   if (country.inCountry || country.transitioning) {
+    if (country.handleKey(e)) return;
     if (e.key === 'Escape') void country.exit();
     else if (e.key === 'f' || e.key === 'F') statsEl.hidden = !statsEl.hidden;
     return;
@@ -629,6 +634,7 @@ net.onCountries = (changed) => {
   }
 };
 net.onNations = (changed) => {
+  if (country.inCountry && net.you?.nationId !== null && net.you?.nationId !== undefined && changed.includes(net.you.nationId)) country.refreshFunds();
   if (selected < 0 || mode !== 'shared') return;
   const n = net.countries[selected].nationId;
   if (n !== null && changed.includes(n)) renderProfileStats(selected);
@@ -683,6 +689,9 @@ if (import.meta.env.DEV || params.has('test')) {
     exitCountry: () => country.exit(),
     country: () => ({ inside: country.inCountry, busy: country.transitioning, stats: country.stats() }),
     countryOrbit: (az, polar, dist) => country.setOrbit(az, polar, dist),
+    pickBuilding: (kind) => country.pickBuilding(kind),
+    findBuildSpot: (kind, valid) => country.findSpot(kind, valid),
+    local: () => [...net.localBuildings.values()],
     memory: () => ({ geometries: globe.renderer.info.memory.geometries, textures: globe.renderer.info.memory.textures, programs: globe.renderer.info.programs?.length ?? 0 }),
     globeDistance: () => globe.distance,
   };

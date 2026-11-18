@@ -35,7 +35,13 @@ export { heightAt };
  * Instanced trees: forests by biome (sparse pines on snow) plus dense groves for
  * Timber/Rubber sites. Placement is seeded per nation, so it is the same every visit.
  */
-export function buildTrees(t: LocalTerrain, seed: number, d: Disposables): THREE.Group {
+export interface Trees {
+  group: THREE.Group;
+  /** hides every tree inside (or next to) the given tile rectangles; shows the rest */
+  clear: (rects: { i: number; j: number; w: number; d: number }[]) => void;
+}
+
+export function buildTrees(t: LocalTerrain, seed: number, d: Disposables): Trees {
   const rng = mulberry32(deriveSeed(seed, 'trees'));
   const n = t.size;
   const spots = new Set<number>();
@@ -90,7 +96,35 @@ export function buildTrees(t: LocalTerrain, seed: number, d: Disposables): THREE
   const g = new THREE.Group();
   g.name = 'trees';
   g.add(trunks, crowns);
-  return g;
+
+  const c0 = (n - 1) / 2;
+  const hidden = new Uint8Array(places.length);
+  const zero = new THREE.Matrix4().makeScale(0, 0, 0);
+  const clear = (rects: { i: number; j: number; w: number; d: number }[]) => {
+    let changed = false;
+    places.forEach((pl, idx) => {
+      const ti = pl.x + c0, tj = c0 - pl.z;
+      const inside = rects.some((r) => ti > r.i - 1.5 && ti < r.i + r.w + 0.5 && tj > r.j - 1.5 && tj < r.j + r.d + 0.5);
+      if (inside === (hidden[idx] === 1)) return;
+      hidden[idx] = inside ? 1 : 0;
+      changed = true;
+      if (inside) {
+        trunks.setMatrixAt(idx, zero);
+        crowns.setMatrixAt(idx, zero);
+      } else {
+        p.set(pl.x, pl.y - 0.05, pl.z);
+        sc.setScalar(pl.s);
+        m.compose(p, q, sc);
+        trunks.setMatrixAt(idx, m);
+        crowns.setMatrixAt(idx, m);
+      }
+    });
+    if (changed) {
+      trunks.instanceMatrix.needsUpdate = true;
+      crowns.instanceMatrix.needsUpdate = true;
+    }
+  };
+  return { group: g, clear };
 }
 
 function box(d: Disposables, w: number, h: number, depth: number, color: string, mats: Map<string, THREE.Material>): THREE.Mesh {

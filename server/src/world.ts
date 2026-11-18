@@ -1,8 +1,9 @@
 import type { AuditEntry, InboxItem, InboxKind, LogEntry, LogKind, Nation, PlayerRec, SessionRec } from '../../shared/model.ts';
+import type { Building } from '../../shared/country/buildings.ts';
 import { COUNTRY_COUNT } from '../../shared/resources.ts';
 import { INBOX_MEMORY, LOG_MEMORY, type ChangeSet, type WorldSnapshot } from './db/repository.ts';
 
-export type SeqKind = 'nation' | 'log' | 'audit' | 'inbox';
+export type SeqKind = 'nation' | 'log' | 'audit' | 'inbox' | 'building';
 
 /**
  * In-memory authoritative world. It is only ever modified through `apply`, with
@@ -18,6 +19,7 @@ export class World {
   readonly territory = new Int32Array(COUNTRY_COUNT).fill(-1);
   log: LogEntry[] = [];
   readonly inbox = new Map<string, InboxItem[]>();
+  readonly buildings = new Map<number, Building>();
 
   static fromSnapshot(s: WorldSnapshot): World {
     const w = new World();
@@ -28,7 +30,14 @@ export class World {
     s.territory.forEach((n, cell) => (w.territory[cell] = n ?? -1));
     w.log = s.log.slice(-LOG_MEMORY);
     for (const m of s.inbox) w.pushInbox(m);
+    for (const b of s.buildings) w.buildings.set(b.id, b);
     return w;
+  }
+
+  buildingsOf(nationId: number): Building[] {
+    const out: Building[] = [];
+    for (const b of this.buildings.values()) if (b.nationId === nationId) out.push(b);
+    return out;
   }
 
   apply(cs: ChangeSet): void {
@@ -40,9 +49,13 @@ export class World {
     }
     for (const n of cs.nations ?? []) this.nations.set(n.id, n);
     for (const [cell, nation] of cs.territory ?? []) this.territory[cell] = nation ?? -1;
+    for (const b of cs.buildings ?? []) this.buildings.set(b.id, b);
+    for (const id of cs.deleteBuildings ?? []) this.buildings.delete(id);
     for (const id of cs.deleteNations ?? []) {
       this.nations.delete(id);
       for (let c = 0; c < COUNTRY_COUNT; c++) if (this.territory[c] === id) this.territory[c] = -1;
+      // the database cascades; mirror it in memory
+      for (const [bid, b] of this.buildings) if (b.nationId === id) this.buildings.delete(bid);
     }
     for (const id of cs.deletePlayers ?? []) {
       this.players.delete(id);
@@ -107,6 +120,8 @@ export class Changes {
   private readonly log: LogEntry[] = [];
   private readonly audit: AuditEntry[] = [];
   private readonly inbox: InboxItem[] = [];
+  private readonly buildings = new Map<number, Building>();
+  private readonly deleteBuildings: number[] = [];
   private readonly seqs = new Map<SeqKind, number>();
 
   constructor(private readonly world: World, private readonly now: number) {}
@@ -177,8 +192,33 @@ export class Changes {
     return e;
   }
 
+  /** Audit entry; the actor's governor name is recorded alongside the id. */
   addAudit(actor: string, action: string, nationId: number | null, detail: string): void {
-    this.audit.push({ id: this.nextId('audit'), at: this.now, actor, action, nationId, detail });
+    const actorName = actor === 'system' ? 'system' : this.player(actor)?.name ?? actor;
+    this.audit.push({ id: this.nextId('audit'), at: this.now, actor, actorName, action, nationId, detail });
+  }
+
+  building(id: number): Building | null {
+    if (this.deleteBuildings.includes(id)) return null;
+    return this.buildings.get(id) ?? this.world.buildings.get(id) ?? null;
+  }
+
+  /** Buildings of a nation including pending changes. */
+  buildingsOf(nationId: number): Building[] {
+    const out = new Map<number, Building>();
+    for (const b of this.world.buildings.values()) if (b.nationId === nationId) out.set(b.id, b);
+    for (const b of this.buildings.values()) if (b.nationId === nationId) out.set(b.id, b);
+    for (const id of this.deleteBuildings) out.delete(id);
+    return [...out.values()];
+  }
+
+  putBuilding(b: Building): void {
+    this.buildings.set(b.id, b);
+  }
+
+  removeBuilding(id: number): void {
+    this.buildings.delete(id);
+    this.deleteBuildings.push(id);
   }
 
   addInbox(playerId: string, kind: InboxKind, title: string, body: string, at = this.now): InboxItem {
@@ -191,7 +231,7 @@ export class Changes {
     return (
       !this.players.size && !this.nations.size && !this.territory.size && !this.sessions.length && !this.deleteSessionsOf.length &&
       !this.deleteNations.length && !this.deletePlayers.length && !Object.keys(this.meta).length && !this.log.length &&
-      !this.audit.length && !this.inbox.length
+      !this.audit.length && !this.inbox.length && !this.buildings.size && !this.deleteBuildings.length
     );
   }
 
@@ -208,6 +248,8 @@ export class Changes {
       log: this.log,
       audit: this.audit,
       inbox: this.inbox,
+      buildings: [...this.buildings.values()],
+      deleteBuildings: this.deleteBuildings,
     };
   }
 }

@@ -20,6 +20,8 @@ export interface GameConfig {
   maxCatchUpTicks: number;
   /** real seconds each war round lasts (UX timer, not scaled) */
   warRoundSeconds: number;
+  /** multiplies building construction times (demo mode builds 20x faster on top of the time scale) */
+  constructionFactor: number;
 }
 
 export const NORMAL_CONFIG: GameConfig = {
@@ -31,9 +33,10 @@ export const NORMAL_CONFIG: GameConfig = {
   sweepEveryTicks: 12,
   maxCatchUpTicks: 100_000,
   warRoundSeconds: 20,
+  constructionFactor: 1,
 };
 
-export const DEMO_CONFIG: GameConfig = { ...NORMAL_CONFIG, demoMode: true, timeScale: 60 };
+export const DEMO_CONFIG: GameConfig = { ...NORMAL_CONFIG, demoMode: true, timeScale: 60, constructionFactor: 0.05 };
 
 const MS_PER_GAME_MINUTE = 60_000;
 const MS_PER_GAME_HOUR = 3_600_000;
@@ -87,6 +90,7 @@ export function configFromEnv(env: Env, isProduction: boolean): { config: GameCo
     sweepEveryTicks: Math.round(num(env, 'SWEEP_EVERY_TICKS', base.sweepEveryTicks, 1, 10_000, warnings)),
     maxCatchUpTicks: Math.round(num(env, 'MAX_CATCH_UP_TICKS', base.maxCatchUpTicks, 1, 10_000_000, warnings)),
     warRoundSeconds: num(env, 'WAR_ROUND_SECONDS', base.warRoundSeconds, 2, 600, warnings),
+    constructionFactor: num(env, 'CONSTRUCTION_FACTOR', base.constructionFactor, 0.0001, 100, warnings),
   };
   return { config, warnings };
 }

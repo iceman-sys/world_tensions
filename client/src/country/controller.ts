@@ -4,7 +4,11 @@ import { generateTerrain } from '../gen/generate.ts';
 import type { NetClient } from '../net/net.ts';
 import { PRIMARIES } from '../../../shared/palette.ts';
 import { terrainInputFor, type LocalTerrain } from '../../../shared/country/terrain.ts';
+import { BUILDINGS, constructionMs, type BuildingKind } from '../../../shared/country/buildings.ts';
 import { CountryView, type CountryStats } from './view.ts';
+import { BuildMenu } from './buildMenu.ts';
+import { placementText, type PlacementHint } from './placement.ts';
+import { formatMoney } from '../ui/format.ts';
 
 /** Camera distance below which zooming onto your own country enters it. */
 export const AUTO_ENTER_DIST = 1.2;
@@ -41,10 +45,64 @@ export class CountryController {
   private cache: { key: string; terrain: LocalTerrain } | null = null;
   private readonly fade: HTMLElement;
   private readonly labels: HTMLElement;
+  private readonly hint: HTMLElement;
+  private menu: BuildMenu | null = null;
 
   constructor(private readonly deps: CountryControllerDeps) {
     this.fade = document.getElementById('country-fade') as HTMLElement;
     this.labels = document.getElementById('country-labels') as HTMLElement;
+    this.hint = document.getElementById('build-hint') as HTMLElement;
+    const { net } = deps;
+    net.onLocal = () => this.view?.setBuildings([...net.localBuildings.values()]);
+    net.onBuildResult = (ok, message) => {
+      if (!ok) deps.toast(message);
+    };
+  }
+
+  /** Real milliseconds a construction takes on this server. */
+  private buildMs(kind: BuildingKind): number {
+    const cfg = this.deps.net.config;
+    if (!cfg) return 0;
+    return constructionMs(kind, 3_600_000 / cfg.timeScale, cfg.constructionFactor);
+  }
+
+  private funds(): number {
+    return this.deps.net.myNation()?.funds ?? 0;
+  }
+
+  private showHint(h: PlacementHint | null): void {
+    if (!h) {
+      this.hint.hidden = true;
+      return;
+    }
+    this.hint.hidden = false;
+    this.hint.classList.toggle('bad', !h.result.ok);
+    this.hint.textContent = `${placementText(h.kind, h.result)} · ${formatMoney(BUILDINGS[h.kind].cost)} · R rotate · right-click cancel`;
+    this.hint.style.transform = `translate(${Math.round(h.x + 16)}px, ${Math.round(h.y + 18)}px)`;
+  }
+
+  /** Keys while in the country view. Returns true if the key was used. */
+  handleKey(e: KeyboardEvent): boolean {
+    if (!this.view) return false;
+    const placing = this.view.placement?.active ?? false;
+    if (e.key === 'Escape' && placing) {
+      this.menu?.select(null);
+      return true;
+    }
+    if ((e.key === 'r' || e.key === 'R') && placing) {
+      this.view.placement?.rotate();
+      return true;
+    }
+    return false;
+  }
+
+  /** Treasury changed: refresh the menu and the HUD. */
+  refreshFunds(): void {
+    const f = this.funds();
+    this.menu?.setFunds(f);
+    this.view?.placement?.refresh();
+    const el = document.getElementById('cv-funds');
+    if (el) el.textContent = formatMoney(f);
   }
 
   get inCountry(): boolean {
@@ -114,11 +172,28 @@ export class CountryController {
         name: map.meta.countries[home].name,
         flag: this.deps.flagCanvas(home, 240, 160),
         neighborTint: (cell) => (cell >= 0 && cell < map.primaries.length ? PRIMARIES[map.primaries[cell]] : null),
+        serverNow: () => this.deps.net.serverNow(),
+        funds: () => this.funds(),
+        onPlace: (kind, i, j, rot) => {
+          // an intent only: the server validates and answers with build:result + local:diff
+          this.deps.net.build(kind, i, j, rot);
+          this.menu?.select(null);
+        },
+        onHint: (h) => this.showHint(h),
       });
       globe.suspend();
       view.start(globe.canvas);
       view.playIntro(INTRO_MS);
       this.view = view;
+      if (this.deps.net.localBuildings.size) view.setBuildings([...this.deps.net.localBuildings.values()]);
+      this.deps.net.openLocal();
+      const menuRoot = document.getElementById('build-menu');
+      const tip = document.getElementById('build-tip');
+      if (menuRoot && tip) {
+        this.menu = new BuildMenu(menuRoot, tip, (k) => this.buildMs(k));
+        this.menu.onSelect = (k) => view.startPlacement(k);
+      }
+      this.refreshFunds();
       document.body.classList.add('in-country');
       this.deps.onChange(true);
       this.fade.classList.remove('on');
@@ -140,6 +215,10 @@ export class CountryController {
     const home = this.homeCell();
     this.fade.classList.add('on');
     await wait(FADE_MS);
+    this.menu?.select(null);
+    this.menu = null;
+    this.hint.hidden = true;
+    this.deps.net.closeLocal();
     this.view.dispose(globe.canvas);
     this.view = null;
     document.body.classList.remove('in-country');
@@ -178,5 +257,15 @@ export class CountryController {
   /** Test hook. */
   setOrbit(az: number, polar: number, dist: number): void {
     this.view?.setOrbit(az, polar, dist);
+  }
+
+  /** Test hook. */
+  findSpot(kind: BuildingKind, valid: boolean): { x: number; y: number; i: number; j: number } | null {
+    return this.view?.findSpot(kind, valid) ?? null;
+  }
+
+  /** Test hook: start placement of a kind (as if picked in the build menu). */
+  pickBuilding(kind: BuildingKind | null): void {
+    this.menu?.select(kind);
   }
 }

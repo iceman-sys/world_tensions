@@ -105,6 +105,8 @@ export interface AuditEntry {
   at: number;
   /** player id, or "system" for rule-driven changes */
   actor: string;
+  /** governor name at the time of the action ("system" for rules) */
+  actorName: string;
   action: string;
   nationId: number | null;
   detail: string;

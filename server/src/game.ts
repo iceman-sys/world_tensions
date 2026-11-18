@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { generateEarthMeta, type EarthMeta } from '../../shared/earth.ts';
-import { inactivityMs, protectionMs, tickMs, type GameConfig } from '../../shared/config.ts';
+import { gameHoursToMs, inactivityMs, protectionMs, tickMs, type GameConfig } from '../../shared/config.ts';
 import { cellCapacity, foundNation, simulateUntil } from '../../shared/economy.ts';
 import { chooseHeir, inactivityDeadline, inheritAssets, isInactiveExpired } from '../../shared/inactivity.ts';
 import type { AwaySnapshot, LogEntry, LostReason, Nation, PlayerRec } from '../../shared/model.ts';
@@ -11,6 +11,27 @@ import type { Rng } from '../../shared/rng.ts';
 import type { ChangeSet, Repository } from './db/repository.ts';
 import { Changes, World } from './world.ts';
 import type { PersistedState } from './state.ts';
+import { TerrainCache } from './country.ts';
+import {
+  BUILDINGS,
+  PLACEMENT_MESSAGES,
+  constructionMs,
+  planStarterTown,
+  validatePlacement,
+  type Building,
+  type BuildingKind,
+  type PlacementReason,
+} from '../../shared/country/buildings.ts';
+
+/** Satisfaction at or below this locks construction (the uprising rule). */
+export const UPRISING_THRESHOLD = 20;
+
+export type BuildResult = { ok: true; building: Building } | { ok: false; reason: PlacementReason | 'no-country' | 'not-found'; message: string };
+
+export interface LocalState {
+  nationId: number;
+  buildings: Building[];
+}
 
 export interface GameDeps {
   repo: Repository;
@@ -25,6 +46,8 @@ export interface GameDeps {
   computeNeighbors: (meta: EarthMeta) => number[][];
   /** smaller generation for tests */
   metaSamples?: number;
+  /** local terrain grid size (tests use a smaller grid; the client always uses the default) */
+  terrainSize?: number;
 }
 
 export interface OpenOptions {
@@ -43,6 +66,8 @@ export function hashToken(token: string): string {
 }
 
 const SYSTEM = 'system';
+/** share of the cost refunded when a construction is cancelled */
+export const CANCEL_REFUND = 0.75;
 
 /**
  * The authoritative game: validates intents, applies rules from /shared, and
@@ -65,6 +90,9 @@ export class Game {
   private pendingLog: LogEntry[] = [];
   private readonly sentCells = new Map<number, string>();
   private readonly sentNations = new Map<number, string>();
+  /** per-nation local changes (buildings), delivered only to that nation's governors */
+  private readonly localDirty = new Map<number, { changed: Set<number>; removed: Set<number> }>();
+  private readonly terrain: TerrainCache;
   /** private notifications for a player (e.g. their country was lost) */
   onPlayerChanged: ((playerId: string) => void) | null = null;
   onDirty: (() => void) | null = null;
@@ -75,6 +103,7 @@ export class Game {
     this.seed = meta.seed;
     this.neighbors = neighbors;
     this.capacity = meta.countries.map(cellCapacity);
+    this.terrain = new TerrainCache(meta, deps.terrainSize);
   }
 
   static async open(deps: GameDeps, opts: OpenOptions): Promise<Game> {
@@ -145,7 +174,11 @@ export class Game {
   private async commit(c: Changes): Promise<ChangeSet> {
     const cs = c.build();
     await this.deps.repo.commit(cs);
+    // remember which nation a deleted building belonged to before it disappears
+    const removedFrom = (cs.deleteBuildings ?? []).map((id) => [id, this.world.buildings.get(id)?.nationId ?? -1] as const);
     this.world.apply(cs);
+    for (const b of cs.buildings ?? []) this.localFor(b.nationId).changed.add(b.id);
+    for (const [id, nid] of removedFrom) if (nid >= 0) this.localFor(nid).removed.add(id);
     for (const [cell] of cs.territory ?? []) this.dirtyCells.add(cell);
     for (const n of cs.nations ?? []) {
       this.dirtyNations.add(n.id);
@@ -162,6 +195,33 @@ export class Game {
     if (cs.log?.length) this.pendingLog.push(...cs.log);
     this.onDirty?.();
     return cs;
+  }
+
+  private localFor(nationId: number): { changed: Set<number>; removed: Set<number> } {
+    let d = this.localDirty.get(nationId);
+    if (!d) {
+      d = { changed: new Set(), removed: new Set() };
+      this.localDirty.set(nationId, d);
+    }
+    return d;
+  }
+
+  /**
+   * Local (private) changes per nation since the last call. The network layer
+   * sends each entry only to that nation's own governors.
+   */
+  drainLocal(): Map<number, { buildings: Building[]; removed: number[] }> {
+    const out = new Map<number, { buildings: Building[]; removed: number[] }>();
+    for (const [nid, d] of this.localDirty) {
+      const buildings: Building[] = [];
+      for (const id of d.changed) {
+        const b = this.world.buildings.get(id);
+        if (b) buildings.push(b);
+      }
+      out.set(nid, { buildings, removed: [...d.removed] });
+    }
+    this.localDirty.clear();
+    return out;
   }
 
   /** Marks a nation's cells for re-broadcast (online status changed outside a commit). */
@@ -269,6 +329,7 @@ export class Game {
       inactivityMs: inactivityMs(cfg),
       protectionMs: protectionMs(cfg),
       warRoundSeconds: cfg.warRoundSeconds,
+      constructionFactor: cfg.constructionFactor,
     };
   }
 
@@ -349,6 +410,8 @@ export class Game {
       const nation = foundNation({ id: nationId, playerId, meta: this.meta.countries[cell], earthSeed: this.seed, now, cfg: this.cfg });
       c.putNation(nation);
       c.setCell(cell, nationId);
+      // humans get their starter town right away; bots get it lazily (they never open the view)
+      if (!opts.bot) this.addStarterTown(c, nation, now);
       const player: PlayerRec = existing
         ? { ...existing, name, nationId, lostReason: null, away: null }
         : { id: playerId, name, bot: !!opts.bot, createdAt: now, lastSeen: now, nationId, away: null, lostReason: null };
@@ -440,6 +503,109 @@ export class Game {
     this.touchNation(p.nationId);
   }
 
+  // ------------------------------------------------------------------ country view (private data)
+
+  private ownCellsOf(c: Changes, nationId: number): number[] {
+    const out: number[] = [];
+    for (let cell = 0; cell < COUNTRY_COUNT; cell++) if (c.cellOwner(cell) === nationId) out.push(cell);
+    return out;
+  }
+
+  /** Server copy of the nation's local terrain (identical to what its client renders). */
+  terrainOf(nationId: number): ReturnType<TerrainCache['get']> | null {
+    const n = this.world.nations.get(nationId);
+    return n ? this.terrain.get(n.homeCell, this.world.cellsOf(n.id)) : null;
+  }
+
+  private addStarterTown(c: Changes, n: Nation, now: number): void {
+    const t = this.terrain.get(n.homeCell, this.ownCellsOf(c, n.id));
+    for (const p of planStarterTown(t, t.capital)) {
+      c.putBuilding({ id: c.nextId('building'), nationId: n.id, kind: p.kind, i: p.i, j: p.j, rot: p.rot, status: 'done', startedAt: now, completesAt: now });
+    }
+    c.addAudit(SYSTEM, 'starter-town', n.id, `starter town founded at tile ${t.capital.i},${t.capital.j}`);
+  }
+
+  /**
+   * The local view's private data for the requesting governor's OWN nation.
+   * There is deliberately no way to ask for another nation: the nation comes
+   * from the player record, never from the request.
+   */
+  openLocal(playerId: string): Promise<LocalState | null> {
+    return this.run(async () => {
+      const p = this.world.players.get(playerId);
+      const n = p ? this.world.nationOfPlayer(p) : null;
+      if (!p || !n) return null;
+      if (this.world.buildingsOf(n.id).length === 0) {
+        const c = new Changes(this.world, this.deps.clock());
+        this.addStarterTown(c, n, this.deps.clock());
+        await this.commit(c);
+      }
+      return { nationId: n.id, buildings: this.world.buildingsOf(n.id) };
+    });
+  }
+
+  /** Validates and starts a construction for the requesting governor's own nation. */
+  build(playerId: string, kind: string, i: number, j: number, rot: 0 | 1): Promise<BuildResult> {
+    return this.run(async () => {
+      const now = this.deps.clock();
+      const p = this.world.players.get(playerId);
+      const n0 = p ? this.world.nationOfPlayer(p) : null;
+      if (!p || !n0) return { ok: false, reason: 'no-country', message: 'You do not govern a country.' };
+      const c = new Changes(this.world, now);
+      // bring the treasury up to date first, so the funds check uses current money
+      const n = this.catchUp(c, n0, now);
+      const t = this.terrain.get(n.homeCell, this.world.cellsOf(n.id));
+      const locked = n.satisfaction <= UPRISING_THRESHOLD;
+      const v = validatePlacement(t, c.buildingsOf(n.id), kind, i, j, rot, n.funds, { locked });
+      if (!v.ok) return { ok: false, reason: v.reason, message: PLACEMENT_MESSAGES[v.reason] };
+      const k = kind as BuildingKind;
+      const spec = BUILDINGS[k];
+      const duration = constructionMs(k, gameHoursToMs(this.cfg, 1), this.cfg.constructionFactor);
+      const building: Building = { id: c.nextId('building'), nationId: n.id, kind: k, i, j, rot, status: 'building', startedAt: now, completesAt: now + duration };
+      c.putNation({ ...n, funds: n.funds - spec.cost });
+      c.putBuilding(building);
+      c.addAudit(p.id, 'build', n.id, `${p.name} ordered a ${spec.label} at tile ${i},${j} for $${spec.cost}`);
+      await this.commit(c);
+      return { ok: true, building };
+    });
+  }
+
+  /** Cancels a construction that is still in progress; 75 % of the cost is refunded. */
+  cancelBuild(playerId: string, buildingId: number): Promise<BuildResult> {
+    return this.run(async () => {
+      const now = this.deps.clock();
+      const p = this.world.players.get(playerId);
+      const n0 = p ? this.world.nationOfPlayer(p) : null;
+      if (!p || !n0) return { ok: false, reason: 'no-country', message: 'You do not govern a country.' };
+      const b = this.world.buildings.get(buildingId);
+      // another nation's building is indistinguishable from a missing one
+      if (!b || b.nationId !== n0.id || b.status !== 'building') return { ok: false, reason: 'not-found', message: 'No such construction site.' };
+      const c = new Changes(this.world, now);
+      const n = this.catchUp(c, n0, now);
+      const refund = Math.round(BUILDINGS[b.kind].cost * CANCEL_REFUND);
+      c.putNation({ ...n, funds: n.funds + refund });
+      c.removeBuilding(b.id);
+      c.addAudit(p.id, 'cancel-build', n.id, `${p.name} cancelled the ${BUILDINGS[b.kind].label} at tile ${b.i},${b.j}; refunded $${refund}`);
+      await this.commit(c);
+      return { ok: true, building: b };
+    });
+  }
+
+  /** Finishes constructions whose timer has run out (called from tick). */
+  private completeConstruction(c: Changes, now: number): number {
+    let done = 0;
+    for (const b of this.world.buildings.values()) {
+      if (b.status !== 'building' || b.completesAt > now) continue;
+      c.putBuilding({ ...b, status: 'done' });
+      const n = this.world.nations.get(b.nationId);
+      const p = n ? this.world.players.get(n.playerId) : undefined;
+      if (p) c.addInbox(p.id, 'info', `${BUILDINGS[b.kind].label} completed`, `The new ${BUILDINGS[b.kind].label.toLowerCase()} at tile ${b.i},${b.j} is open.`, b.completesAt);
+      c.addAudit(SYSTEM, 'construction-complete', b.nationId, `${BUILDINGS[b.kind].label} at tile ${b.i},${b.j} completed`);
+      done++;
+    }
+    return done;
+  }
+
   /** Removes a player and their country (dev bots). */
   release(playerId: string): Promise<void> {
     return this.run(async () => {
@@ -486,7 +652,8 @@ export class Game {
         advanced++;
       }
       for (const n of expired) this.loseNation(c, n, 'inactivity', now);
-      if (advanced || expired.length) c.addAudit(SYSTEM, 'tick', null, `economy advanced for ${advanced} countries; ${expired.length} lost to inactivity`);
+      const built = this.completeConstruction(c, now);
+      if (advanced || expired.length) c.addAudit(SYSTEM, 'tick', null, `economy advanced for ${advanced} countries; ${expired.length} lost to inactivity; ${built} constructions completed`);
       if (!c.empty) await this.commit(c);
     });
   }

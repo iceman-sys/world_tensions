@@ -4,6 +4,7 @@ import { dirname } from 'node:path';
 import type { AuditEntry, InboxItem, InboxKind, LogEntry, LogKind, LostReason, Nation, NationHistory, PlayerRec, ResourceAmounts, SessionRec } from '../../../shared/model.ts';
 import { COUNTRY_COUNT, RESOURCE_CATALOG, type ResourceName } from '../../../shared/resources.ts';
 import { INBOX_MEMORY, LOG_MEMORY, type ChangeSet, type Repository, type WorldSnapshot } from './repository.ts';
+import { BUILDING_KINDS, type Building, type BuildingKind } from '../../../shared/country/buildings.ts';
 
 /** Ordered schema migrations; PRAGMA user_version records how many have run. */
 const MIGRATIONS: string[] = [
@@ -125,6 +126,21 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX inbox_player ON inbox(player_id, id);
   `,
+  /* sql */ `
+  CREATE TABLE buildings (
+    id INTEGER PRIMARY KEY,
+    country_id INTEGER NOT NULL REFERENCES countries(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    i INTEGER NOT NULL,
+    j INTEGER NOT NULL,
+    rot INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    completes_at INTEGER NOT NULL
+  );
+  CREATE INDEX buildings_country ON buildings(country_id);
+  ALTER TABLE audit_log ADD COLUMN actor_name TEXT NOT NULL DEFAULT '';
+  `,
 ];
 
 interface PlayerRow { id: string; name: string; bot: number; created_at: number; last_seen: number; country_id: number | null; away: string | null; lost_reason: string | null }
@@ -136,7 +152,8 @@ interface CountryRow {
 }
 interface ResourceRow { country_id: number; resource: string; stock: number; production: number }
 interface LogRow { id: number; at: number; kind: string; text: string; cells: string }
-interface AuditRow { id: number; at: number; actor: string; action: string; country_id: number | null; detail: string }
+interface AuditRow { id: number; at: number; actor: string; actor_name: string; action: string; country_id: number | null; detail: string }
+interface BuildingRow { id: number; country_id: number; kind: string; i: number; j: number; rot: number; status: string; started_at: number; completes_at: number }
 interface InboxRow { id: number; player_id: string; at: number; kind: string; title: string; body: string }
 
 const RESOURCES = new Set<string>(RESOURCE_CATALOG);
@@ -247,7 +264,25 @@ export class SqliteRepository implements Repository {
       .all(INBOX_MEMORY)
       .map((r): InboxItem => ({ id: r.id, playerId: r.player_id, at: r.at, kind: r.kind as InboxKind, title: r.title, body: r.body }));
 
-    return { meta, players, sessions, nations, territory, log, inbox };
+    const buildings = db
+      .prepare<[], BuildingRow>('SELECT * FROM buildings ORDER BY id')
+      .all()
+      .filter((r) => (BUILDING_KINDS as readonly string[]).includes(r.kind))
+      .map(
+        (r): Building => ({
+          id: r.id,
+          nationId: r.country_id,
+          kind: r.kind as BuildingKind,
+          i: r.i,
+          j: r.j,
+          rot: r.rot === 1 ? 1 : 0,
+          status: r.status === 'done' ? 'done' : 'building',
+          startedAt: r.started_at,
+          completesAt: r.completes_at,
+        }),
+      );
+
+    return { meta, players, sessions, nations, territory, log, inbox, buildings };
   }
 
   async commit(cs: ChangeSet): Promise<void> {
@@ -355,8 +390,19 @@ export class SqliteRepository implements Repository {
         for (const e of cs.log) st.run(e.id, e.at, e.kind, e.text, JSON.stringify(e.cells));
       }
       if (cs.audit?.length) {
-        const st = db.prepare('INSERT INTO audit_log (id, at, actor, action, country_id, detail) VALUES (?, ?, ?, ?, ?, ?)');
-        for (const e of cs.audit) st.run(e.id, e.at, e.actor, e.action, e.nationId, e.detail);
+        const st = db.prepare('INSERT INTO audit_log (id, at, actor, actor_name, action, country_id, detail) VALUES (?, ?, ?, ?, ?, ?, ?)');
+        for (const e of cs.audit) st.run(e.id, e.at, e.actor, e.actorName, e.action, e.nationId, e.detail);
+      }
+      if (cs.buildings?.length) {
+        const st = db.prepare(
+          `INSERT INTO buildings (id, country_id, kind, i, j, rot, status, started_at, completes_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET status = excluded.status, started_at = excluded.started_at, completes_at = excluded.completes_at`,
+        );
+        for (const b of cs.buildings) st.run(b.id, b.nationId, b.kind, b.i, b.j, b.rot, b.status, b.startedAt, b.completesAt);
+      }
+      if (cs.deleteBuildings?.length) {
+        const st = db.prepare('DELETE FROM buildings WHERE id = ?');
+        for (const id of cs.deleteBuildings) st.run(id);
       }
       if (cs.inbox?.length) {
         const st = db.prepare('INSERT INTO inbox (id, player_id, at, kind, title, body) VALUES (?, ?, ?, ?, ?, ?)');
@@ -370,7 +416,7 @@ export class SqliteRepository implements Repository {
       nationId === undefined
         ? this.db.prepare<[number], AuditRow>('SELECT * FROM audit_log ORDER BY id DESC LIMIT ?').all(limit)
         : this.db.prepare<[number, number], AuditRow>('SELECT * FROM audit_log WHERE country_id = ? ORDER BY id DESC LIMIT ?').all(nationId, limit);
-    return rows.map((r) => ({ id: r.id, at: r.at, actor: r.actor, action: r.action, nationId: r.country_id, detail: r.detail }));
+    return rows.map((r) => ({ id: r.id, at: r.at, actor: r.actor, actorName: r.actor_name, action: r.action, nationId: r.country_id, detail: r.detail }));
   }
 
   async close(): Promise<void> {

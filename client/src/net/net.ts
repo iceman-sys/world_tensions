@@ -1,5 +1,6 @@
 import type { AwaySummary, ClientConfig, ClientMessage, CountryState, EarthCounts, ErrorCode, NationView, ServerMessage, You } from '../../../shared/protocol.ts';
 import type { LogEntry } from '../../../shared/model.ts';
+import type { Building, BuildingKind } from '../../../shared/country/buildings.ts';
 import { COUNTRY_COUNT } from '../../../shared/resources.ts';
 
 const emptyCell = (id: number): CountryState => ({ id, owner: null, online: false, lastSeen: 0, bot: false, nationId: null, homeCell: id, lostAt: null });
@@ -51,6 +52,12 @@ export class NetClient {
   onAway: ((summary: AwaySummary) => void) | null = null;
   onLog: ((entries: LogEntry[]) => void) | null = null;
   onError: ((code: ErrorCode, message: string) => void) | null = null;
+  /** private country-view data for your own nation (only ever sent to you) */
+  readonly localBuildings = new Map<number, Building>();
+  localNationId: number | null = null;
+  onLocal: ((changed: Building[], removed: number[], full: boolean) => void) | null = null;
+  onBuildResult: ((ok: boolean, message: string) => void) | null = null;
+  private wantLocal = false;
 
   private ws: WebSocket | null = null;
   private retry = 0;
@@ -127,6 +134,27 @@ export class NetClient {
     this.send({ t: 'dev:bots', on });
   }
 
+  /** Subscribe to your own nation's country-view data (re-sent after reconnects). */
+  openLocal(): void {
+    this.wantLocal = true;
+    this.send({ t: 'local:open' });
+  }
+
+  closeLocal(): void {
+    this.wantLocal = false;
+    this.localBuildings.clear();
+    this.localNationId = null;
+    this.send({ t: 'local:close' });
+  }
+
+  build(kind: BuildingKind, i: number, j: number, rot: 0 | 1): void {
+    this.send({ t: 'build', kind, i, j, rot });
+  }
+
+  cancelBuild(id: number): void {
+    this.send({ t: 'build:cancel', id });
+  }
+
   private send(msg: ClientMessage): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(msg));
   }
@@ -177,8 +205,28 @@ export class NetClient {
         this.onCountries?.(this.countries.map((c) => c.id));
         this.onNations?.([...this.nations.keys()]);
         this.onLog?.(this.log);
+        if (this.wantLocal && msg.you && msg.you.countryId >= 0) this.send({ t: 'local:open' });
         break;
       }
+      case 'local:state': {
+        this.clockOffset = msg.now - Date.now();
+        this.localNationId = msg.state.nationId;
+        this.localBuildings.clear();
+        for (const b of msg.state.buildings) this.localBuildings.set(b.id, b);
+        this.onLocal?.(msg.state.buildings, [], true);
+        break;
+      }
+      case 'local:diff': {
+        if (msg.nationId !== this.localNationId) break;
+        this.clockOffset = msg.now - Date.now();
+        for (const b of msg.buildings) this.localBuildings.set(b.id, b);
+        for (const id of msg.removed) this.localBuildings.delete(id);
+        this.onLocal?.(msg.buildings, msg.removed, false);
+        break;
+      }
+      case 'build:result':
+        this.onBuildResult?.(msg.ok, msg.message);
+        break;
       case 'joined':
         this.you = msg.you;
         writeToken(msg.token);

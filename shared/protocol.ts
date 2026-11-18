@@ -1,5 +1,6 @@
 /** Wire protocol between the browser and the authoritative server (JSON over WebSocket). */
 import type { InboxItem, LogEntry, LostReason, Military } from './model.ts';
+import { BUILDING_KINDS, type Building, type BuildingKind } from './country/buildings.ts';
 
 /** Per-cell map state (one of the 200 generated territories). */
 export interface CountryState {
@@ -62,6 +63,8 @@ export interface ClientConfig {
   inactivityMs: number;
   protectionMs: number;
   warRoundSeconds: number;
+  /** multiplies building construction times */
+  constructionFactor: number;
 }
 
 export interface AwaySummary {
@@ -79,11 +82,23 @@ export interface AwaySummary {
 }
 
 // ---- client -> server ----
+// Country-view messages never carry a nation id: the server always acts on the
+// sender's own nation, so another country's private data cannot be requested.
 export type ClientMessage =
   | { t: 'hello'; token: string | null }
   | { t: 'join'; name: string }
   | { t: 'ping' }
-  | { t: 'dev:bots'; on: boolean };
+  | { t: 'dev:bots'; on: boolean }
+  | { t: 'local:open' }
+  | { t: 'local:close' }
+  | { t: 'build'; kind: BuildingKind; i: number; j: number; rot: 0 | 1 }
+  | { t: 'build:cancel'; id: number };
+
+/** Private country-view data, sent only to the nation's own governors. */
+export interface LocalStateMsg {
+  nationId: number;
+  buildings: Building[];
+}
 
 // ---- server -> client ----
 export type ServerMessage =
@@ -106,6 +121,9 @@ export type ServerMessage =
   | { t: 'diff'; countries: CountryState[]; counts: EarthCounts; nations: NationView[]; removedNations: number[]; now: number }
   | { t: 'away'; summary: AwaySummary }
   | { t: 'log'; entries: LogEntry[] }
+  | { t: 'local:state'; state: LocalStateMsg; now: number }
+  | { t: 'local:diff'; nationId: number; buildings: Building[]; removed: number[]; now: number }
+  | { t: 'build:result'; ok: boolean; message: string; buildingId: number | null }
   | { t: 'error'; code: ErrorCode; message: string }
   | { t: 'pong' };
 
@@ -116,7 +134,8 @@ export type ErrorCode =
   | 'already-joined'
   | 'earth-full'
   | 'not-allowed'
-  | 'server-error';
+  | 'server-error'
+  | 'no-country';
 
 export const NAME_MIN = 2;
 export const NAME_MAX = 20;
@@ -133,6 +152,15 @@ export function isValidName(name: string): boolean {
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/** Tile coordinates: integers within any supported terrain grid. */
+function isTile(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 0 && v < 1024;
+}
+
+function isId(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v > 0 && v < 2 ** 31;
 }
 
 function hasExactKeys(o: Record<string, unknown>, keys: string[]): boolean {
@@ -166,6 +194,19 @@ export function parseClientMessage(raw: string): ClientMessage | null {
     case 'dev:bots':
       if (!hasExactKeys(v, ['t', 'on']) || typeof v.on !== 'boolean') return null;
       return { t: 'dev:bots', on: v.on };
+    case 'local:open':
+      return hasExactKeys(v, ['t']) ? { t: 'local:open' } : null;
+    case 'local:close':
+      return hasExactKeys(v, ['t']) ? { t: 'local:close' } : null;
+    case 'build': {
+      if (!hasExactKeys(v, ['t', 'kind', 'i', 'j', 'rot'])) return null;
+      if (typeof v.kind !== 'string' || !(BUILDING_KINDS as readonly string[]).includes(v.kind)) return null;
+      if (!isTile(v.i) || !isTile(v.j) || (v.rot !== 0 && v.rot !== 1)) return null;
+      return { t: 'build', kind: v.kind as BuildingKind, i: v.i, j: v.j, rot: v.rot };
+    }
+    case 'build:cancel':
+      if (!hasExactKeys(v, ['t', 'id']) || !isId(v.id)) return null;
+      return { t: 'build:cancel', id: v.id };
     default:
       return null;
   }
