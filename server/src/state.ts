@@ -30,8 +30,9 @@ const newId = () => randomBytes(9).toString('base64url');
 const newToken = () => randomBytes(24).toString('base64url');
 
 /**
- * Authoritative Earth ownership. Pure logic, no networking: the server feeds it
- * validated requests and broadcasts whatever it changes.
+ * Earth ownership as it was persisted before the SQLite database (state.json).
+ * The live server now uses Game + World (server/src/game.ts); this class is kept
+ * to read and validate old save files, which are imported into a fresh database.
  */
 export class EarthState {
   readonly players = new Map<string, Player>();
@@ -115,7 +116,16 @@ export class EarthState {
 
   countryState(id: number): CountryState {
     const p = this.ownerOf(id);
-    return { id, owner: p ? p.name : null, online: p ? p.online : false, lastSeen: p ? p.lastSeen : 0, bot: p ? p.bot : false };
+    return {
+      id,
+      owner: p ? p.name : null,
+      online: p ? p.online : false,
+      lastSeen: p ? p.lastSeen : 0,
+      bot: p ? p.bot : false,
+      nationId: null,
+      homeCell: id,
+      lostAt: null,
+    };
   }
 
   allCountries(): CountryState[] {
@@ -131,7 +141,7 @@ export class EarthState {
   }
 
   you(p: Player): You {
-    return { playerId: p.id, name: p.name, countryId: p.countryId };
+    return { playerId: p.id, name: p.name, countryId: p.countryId, nationId: null, lostReason: null };
   }
 
   toJSON(): PersistedState {

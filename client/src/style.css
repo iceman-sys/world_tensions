@@ -182,6 +182,22 @@ kbd { font-family: ui-monospace, monospace; font-size: 11px; padding: 1px 5px; b
 .dialog input { width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: rgba(255,255,255,.06); }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 
+.dialog.wide { width: min(520px, calc(100vw - 32px)); }
+#p-status.warn { color: #ffb36b; }
+.pill { display: inline-flex; align-items: center; gap: 4px; margin-left: 6px; padding: 1px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600; }
+.pill.shield { background: rgba(79, 179, 255, 0.14); border: 1px solid rgba(79, 179, 255, 0.45); color: #cfe8ff; }
+.away-table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; margin-top: 8px; }
+.away-table th, .away-table td { padding: 5px 6px; text-align: right; border-bottom: 1px solid var(--line); }
+.away-table th[scope='row'], .away-table thead th:first-child { text-align: left; font-weight: 600; }
+.away-table thead th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
+.away-table .up { color: var(--good); }
+.away-table .down { color: var(--bad); }
+.lost { padding: 10px 12px; border-radius: 10px; background: rgba(255, 107, 107, 0.12); border: 1px solid rgba(255, 107, 107, 0.4); }
+.away-events { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; font-size: 13px; }
+.away-events li { display: grid; gap: 2px; padding: 6px 8px; border-radius: 8px; background: rgba(255, 255, 255, 0.04); }
+.away-events li.danger { border-left: 3px solid var(--bad); }
+.away-events li.warning { border-left: 3px solid #ffb36b; }
+
 .footer { position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%); font-size: 11.5px; color: rgba(200, 215, 235, 0.55); z-index: 2; pointer-events: none; letter-spacing: 0.04em; }
 
 /* ---------- responsive ---------- */

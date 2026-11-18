@@ -25,6 +25,24 @@ export function timeAgo(ms: number): string {
   return `${Math.floor(s / 86400)} d ago`;
 }
 
+/** Compact countdown, e.g. "1h 05m", "4m 09s", "12s". */
+export function formatDuration(ms: number): string {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${String(m).padStart(2, '0')}m`;
+  if (m > 0) return `${m}m ${String(sec).padStart(2, '0')}s`;
+  return `${sec}s`;
+}
+
+export function formatSigned(n: number, fmt: (v: number) => string): string {
+  if (Math.round(n) === 0) return '±0';
+  return `${n > 0 ? '+' : '−'}${fmt(Math.abs(n))}`;
+}
+
 export function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] ?? c);
 }

@@ -2,7 +2,7 @@
   "name": "world-tensions-globe-prototype",
   "version": "0.1.0",
   "private": true,
-  "description": "World Tensions: Globe Prototype — a browser 3D globe with 200 procedural countries and a tiny authoritative server.",
+  "description": "World Tensions: Globe Prototype â€” a browser 3D globe with 200 procedural countries and a tiny authoritative server.",
   "type": "module",
   "scripts": {
     "dev": "concurrently -k -n server,client -c blue,green \"npm:dev:server\" \"npm:dev:client\"",
@@ -13,16 +13,19 @@
     "preview": "vite preview",
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "shots": "node scripts/shots.mjs"
+    "shots": "node scripts/shots.mjs",
+    "e2e": "node scripts/e2e.mjs"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
+    "better-sqlite3": "^13.2.0",
     "three": "^0.187.0",
     "ws": "^8.23.0"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^26.6.6",
     "@types/three": "^0.187.0",
     "@types/ws": "^8.18.2",

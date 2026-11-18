@@ -31,6 +31,8 @@ async function shot(name, { query = '', lat = 18, lon = 30, dist = 3.3, size = [
   const page = await browser.newPage({ viewport: { width: size[0], height: size[1] } });
   page.setDefaultTimeout(240000);
   page.on('console', (m) => {
+    // Chromium/SwiftShader readback noise caused by page.screenshot itself, not by the app
+    if (/GL Driver Message|glBlitFramebuffer: Blit feedback loop/.test(m.text())) return;
     if (m.type() === 'error' || m.type() === 'warning') errors.push(`${name} ${m.type()}: ${m.text()}`);
   });
   page.on('pageerror', (e) => errors.push(`${name} pageerror: ${e.message}`));

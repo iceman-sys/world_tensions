@@ -1,5 +1,9 @@
-import type { ClientMessage, CountryState, EarthCounts, ErrorCode, ServerMessage, You } from '../../../shared/protocol.ts';
+import type { AwaySummary, ClientConfig, ClientMessage, CountryState, EarthCounts, ErrorCode, NationView, ServerMessage, You } from '../../../shared/protocol.ts';
+import type { LogEntry } from '../../../shared/model.ts';
 import { COUNTRY_COUNT } from '../../../shared/resources.ts';
+
+const emptyCell = (id: number): CountryState => ({ id, owner: null, online: false, lastSeen: 0, bot: false, nationId: null, homeCell: id, lostAt: null });
+const LOG_KEEP = 200;
 
 export type NetStatus = 'disabled' | 'connecting' | 'online' | 'reconnecting';
 
@@ -28,19 +32,24 @@ export class NetClient {
   you: You | null = null;
   seed: number | null = null;
   devTools = false;
-  readonly countries: CountryState[] = Array.from({ length: COUNTRY_COUNT }, (_, id) => ({
-    id,
-    owner: null,
-    online: false,
-    lastSeen: 0,
-    bot: false,
-  }));
+  readonly countries: CountryState[] = Array.from({ length: COUNTRY_COUNT }, (_, id) => emptyCell(id));
+  readonly nations = new Map<number, NationView>();
+  /** authoritative neighbour graph from the server (null until welcomed) */
+  neighbors: number[][] | null = null;
+  config: ClientConfig | null = null;
+  log: LogEntry[] = [];
   counts: EarthCounts = { slotsUsed: 0, online: 0, offline: 0, defeated: 0 };
+  /** server clock minus local clock, for countdowns */
+  private clockOffset = 0;
 
   onStatus: ((s: NetStatus) => void) | null = null;
   onWelcome: ((seed: number) => void) | null = null;
   onCountries: ((changed: number[]) => void) | null = null;
+  onNations: ((changed: number[]) => void) | null = null;
   onJoined: ((you: You) => void) | null = null;
+  onYou: ((you: You) => void) | null = null;
+  onAway: ((summary: AwaySummary) => void) | null = null;
+  onLog: ((entries: LogEntry[]) => void) | null = null;
   onError: ((code: ErrorCode, message: string) => void) | null = null;
 
   private ws: WebSocket | null = null;
@@ -55,6 +64,22 @@ export class NetClient {
 
   get enabled(): boolean {
     return this.url !== null;
+  }
+
+  /** Current time on the server's clock (epoch ms). */
+  serverNow(): number {
+    return Date.now() + this.clockOffset;
+  }
+
+  /** Nation holding a cell, if any. */
+  nationAt(cell: number): NationView | null {
+    const id = this.countries[cell]?.nationId;
+    return id === null || id === undefined ? null : this.nations.get(id) ?? null;
+  }
+
+  myNation(): NationView | null {
+    const id = this.you?.nationId;
+    return id === null || id === undefined ? null : this.nations.get(id) ?? null;
   }
 
   connect(): void {
@@ -137,17 +162,21 @@ export class NetClient {
         this.seed = msg.seed;
         this.you = msg.you;
         this.devTools = msg.devTools;
+        this.config = msg.config;
+        this.neighbors = msg.neighbors;
+        this.clockOffset = msg.now - Date.now();
+        this.log = msg.log.slice(-LOG_KEEP);
         if (!msg.you) writeToken(null);
-        for (const c of this.countries) {
-          c.owner = null;
-          c.online = false;
-          c.bot = false;
-        }
+        for (let id = 0; id < COUNTRY_COUNT; id++) this.countries[id] = emptyCell(id);
         this.applyCountries(msg.countries);
+        this.nations.clear();
+        for (const n of msg.nations) this.nations.set(n.id, n);
         this.counts = msg.counts;
         this.setStatus('online');
         this.onWelcome?.(msg.seed);
         this.onCountries?.(this.countries.map((c) => c.id));
+        this.onNations?.([...this.nations.keys()]);
+        this.onLog?.(this.log);
         break;
       }
       case 'joined':
@@ -155,9 +184,28 @@ export class NetClient {
         writeToken(msg.token);
         this.onJoined?.(msg.you);
         break;
-      case 'diff':
+      case 'you': {
+        const hadCountry = (this.you?.countryId ?? -1) >= 0;
+        this.you = msg.you;
+        if (!hadCountry && msg.you.countryId >= 0) this.onJoined?.(msg.you);
+        else this.onYou?.(msg.you);
+        break;
+      }
+      case 'diff': {
         this.counts = msg.counts;
+        this.clockOffset = msg.now - Date.now();
+        for (const n of msg.nations) this.nations.set(n.id, n);
+        for (const id of msg.removedNations) this.nations.delete(id);
         this.onCountries?.(this.applyCountries(msg.countries));
+        if (msg.nations.length || msg.removedNations.length) this.onNations?.([...msg.nations.map((n) => n.id), ...msg.removedNations]);
+        break;
+      }
+      case 'away':
+        this.onAway?.(msg.summary);
+        break;
+      case 'log':
+        this.log = [...this.log, ...msg.entries].slice(-LOG_KEEP);
+        this.onLog?.(msg.entries);
         break;
       case 'error':
         this.onError?.(msg.code, msg.message);

@@ -4,10 +4,11 @@ import { generateEarthMap, type EarthMap } from './gen/generate.ts';
 import { drawFlag, flagColors } from './render/flags.ts';
 import { NetClient, resolveServerUrl, type NetStatus } from './net/net.ts';
 import { OwnerMarkers } from './ui/markers.ts';
-import { $, escapeHtml, formatArea, formatInt, formatMoney, formatPopulation, timeAgo } from './ui/format.ts';
+import { $, escapeHtml, formatArea, formatDuration, formatInt, formatMoney, formatPopulation, timeAgo } from './ui/format.ts';
+import { renderAwaySummary } from './ui/away.ts';
 import { deriveSeed, formatSeed, mulberry32, parseSeed, randomSeed } from '../../shared/rng.ts';
 import { DEFAULT_FACE_SIZE } from '../../shared/cube.ts';
-import { isValidName, normalizeName, NAME_MAX, NAME_MIN } from '../../shared/protocol.ts';
+import { isValidName, normalizeName, NAME_MAX, NAME_MIN, type CountryState, type NationView, type You } from '../../shared/protocol.ts';
 
 type Mode = 'shared' | 'local';
 
@@ -25,6 +26,7 @@ declare global {
       centroid: (id: number) => [number, number, number];
       neighbors: (id: number) => number[];
       owners: () => (string | null)[];
+      net: () => { status: NetStatus; you: You | null; nations: NationView[]; countries: CountryState[] };
     };
   }
 }
@@ -52,6 +54,7 @@ const joinName = $('join-name') as HTMLInputElement;
 const joinError = $('join-error');
 const botsRow = $('bots-row');
 const botsToggle = $('bots-toggle') as HTMLInputElement;
+const awayDialog = $('away-dialog') as HTMLDialogElement;
 
 // ---------- core objects ----------
 const globe = new Globe(stage);
@@ -155,7 +158,7 @@ async function loadEarth(seed: number, newMode: Mode): Promise<void> {
   loadBookmarks();
   renderBookmarks();
   markers.clear();
-  if (mode === 'shared') for (const c of net.countries) markers.update(c, c.id === net.you?.countryId);
+  if (mode === 'shared') for (const c of net.countries) markers.update(c, c.nationId !== null && c.nationId === net.you?.nationId);
   updateDashboard();
   updateModeUi();
   console.info(`[world-tensions] Earth ${formatSeed(seed)} generated in ${map.genMs.toFixed(0)} ms (${faceSize}px faces)`);
@@ -168,11 +171,15 @@ async function loadEarth(seed: number, newMode: Mode): Promise<void> {
   if (window.__wt) window.__wt.ready = true;
 }
 
+function hasCountry(): boolean {
+  return !!net.you && net.you.countryId >= 0;
+}
+
 function updateModeUi(): void {
   const shared = mode === 'shared';
-  btnMy.hidden = !(shared && net.you);
-  btnJoin.hidden = shared && !!net.you;
-  btnJoin.textContent = shared ? 'Join Earth' : net.enabled ? 'Back to shared Earth' : 'Join Earth';
+  btnMy.hidden = !(shared && hasCountry());
+  btnJoin.hidden = shared && hasCountry();
+  btnJoin.textContent = shared ? (net.you ? 'Found new country' : 'Join Earth') : net.enabled ? 'Back to shared Earth' : 'Join Earth';
   btnJoin.disabled = !net.enabled;
   btnJoin.title = net.enabled ? '' : 'No server configured for this build';
   botsRow.hidden = !(import.meta.env.DEV && net.devTools && shared);
@@ -211,22 +218,36 @@ function updateNetDot(s: NetStatus): void {
 // ---------- profile ----------
 const profileFlag = $('profile-flag') as HTMLCanvasElement;
 
+/** Live server values for a governed cell; generated starting values otherwise. */
+function renderProfileStats(id: number): void {
+  if (!map) return;
+  const c = map.meta.countries[id];
+  const n = mode === 'shared' ? net.nationAt(id) : null;
+  const sat = n ? n.satisfaction : c.satisfaction;
+  $('p-pop').textContent = formatPopulation(n ? n.population : c.population);
+  $('p-area').textContent = formatArea(map.areaKm2[id]);
+  $('p-sat').textContent = `${Number.isInteger(sat) ? sat : sat.toFixed(1)}%`;
+  $('p-sat-bar').style.width = `${Math.max(0, Math.min(100, sat))}%`;
+  $('p-funds').textContent = formatMoney(n ? n.funds : c.funds);
+  $('p-mil-size').textContent = `${formatInt(n ? n.military.size : c.militarySize)} troops`;
+  $('p-mil-str').textContent = `${Math.round(n ? n.military.readiness : c.militaryStrength)} / 100`;
+  const resources = n ? n.resources : c.resources;
+  $('p-resources').replaceChildren(...resources.map((r) => Object.assign(document.createElement('li'), { textContent: r })));
+}
+
+function neighborsOf(id: number): number[] {
+  if (mode === 'shared' && net.neighbors) return net.neighbors[id] ?? [];
+  return map ? map.neighbors[id] : [];
+}
+
 function openProfile(id: number): void {
   if (!map) return;
   const c = map.meta.countries[id];
   flagCanvas(id, 72, 48, profileFlag);
   $('p-name').textContent = c.name;
-  $('p-pop').textContent = formatPopulation(c.population);
-  $('p-area').textContent = formatArea(map.areaKm2[id]);
-  $('p-sat').textContent = `${c.satisfaction}%`;
-  $('p-sat-bar').style.width = `${c.satisfaction}%`;
-  $('p-funds').textContent = formatMoney(c.funds);
-  $('p-mil-size').textContent = `${formatInt(c.militarySize)} troops`;
-  $('p-mil-str').textContent = `${c.militaryStrength} / 100`;
-  const res = $('p-resources');
-  res.replaceChildren(...c.resources.map((r) => Object.assign(document.createElement('li'), { textContent: r })));
+  renderProfileStats(id);
   const nb = $('p-neighbors');
-  const neighbors = [...map.neighbors[id]].sort((a, b) => countryName(a).localeCompare(countryName(b)));
+  const neighbors = [...neighborsOf(id)].sort((a, b) => countryName(a).localeCompare(countryName(b)));
   $('p-ncount').textContent = `(${neighbors.length})`;
   nb.replaceChildren(
     ...neighbors.map((n) => {
@@ -252,12 +273,19 @@ function updateProfileStatus(id: number): void {
   if (mode === 'shared' && net.status !== 'disabled') {
     const s = net.countries[id];
     if (s.owner) {
+      const now = net.serverNow();
       dot.classList.toggle('on', s.online);
-      status.textContent = s.online ? 'Online' : `Offline · seen ${timeAgo(s.lastSeen)}`;
-      const mine = net.you?.countryId === id;
-      owner.innerHTML = `<span class="badge"><span class="dot ${s.online ? 'on' : ''}"></span>${escapeHtml(s.owner)}${s.bot ? ' <span class="muted">(bot)</span>' : ''}${mine ? ' <span class="muted">(you)</span>' : ''}</span>`;
+      let text = s.online ? 'Online' : `Offline · seen ${timeAgo(s.lastSeen - (now - Date.now()))}`;
+      if (s.lostAt !== null) text += s.lostAt > now ? ` · lost in ${formatDuration(s.lostAt - now)}` : ' · expiring';
+      status.textContent = text;
+      status.classList.toggle('warn', s.lostAt !== null);
+      const mine = s.nationId !== null && net.you?.nationId === s.nationId;
+      const n = net.nationAt(id);
+      const prot = n && n.protectedUntil > now ? ` <span class="pill shield" title="New countries cannot declare war or be attacked">Protected ${formatDuration(n.protectedUntil - now)}</span>` : '';
+      owner.innerHTML = `<span class="badge"><span class="dot ${s.online ? 'on' : ''}"></span>${escapeHtml(s.owner)}${s.bot ? ' <span class="muted">(bot)</span>' : ''}${mine ? ' <span class="muted">(you)</span>' : ''}</span>${prot}`;
     } else {
       dot.classList.remove('on');
+      status.classList.remove('warn');
       status.textContent = 'Unclaimed';
       owner.innerHTML = '<span class="muted">Unclaimed. Join to be assigned a random country.</span>';
     }
@@ -461,6 +489,7 @@ btnJoin.addEventListener('click', () => {
     return;
   }
   joinError.textContent = '';
+  if (net.you && !joinName.value) joinName.value = net.you.name;
   joinDialog.showModal();
   joinName.focus();
 });
@@ -530,18 +559,44 @@ net.onWelcome = (seed) => {
   }
   updateDashboard();
 };
+const isMine = (cell: number) => net.countries[cell].nationId !== null && net.countries[cell].nationId === net.you?.nationId;
+
 net.onCountries = (changed) => {
-  if (mode === 'shared' && map) for (const id of changed) markers.update(net.countries[id], id === net.you?.countryId);
+  if (mode === 'shared' && map) for (const id of changed) markers.update(net.countries[id], isMine(id));
   updateDashboard();
-  if (selected >= 0 && changed.includes(selected)) updateProfileStatus(selected);
+  if (selected >= 0 && changed.includes(selected)) {
+    updateProfileStatus(selected);
+    renderProfileStats(selected);
+  }
+};
+net.onNations = (changed) => {
+  if (selected < 0 || mode !== 'shared') return;
+  const n = net.countries[selected].nationId;
+  if (n !== null && changed.includes(n)) renderProfileStats(selected);
 };
 net.onJoined = (you) => {
   joinDialog.close();
   updateModeUi();
-  for (const c of net.countries) markers.update(c, c.id === you.countryId);
+  for (const c of net.countries) markers.update(c, isMine(c.id));
   toast(`Welcome, ${you.name}. You govern ${countryName(you.countryId)}.`, 4500);
   select(you.countryId, true);
 };
+net.onYou = (you) => {
+  updateModeUi();
+  for (const c of net.countries) markers.update(c, isMine(c.id));
+  if (you.countryId < 0 && you.lostReason && !awayDialog.open) toast('Your country was lost. Use "Found new country" to start again.', 6000);
+};
+net.onAway = (summary) => {
+  const { period, html } = renderAwaySummary(summary);
+  $('away-period').textContent = period;
+  $('away-body').innerHTML = html;
+  if (!awayDialog.open) awayDialog.showModal();
+};
+
+// live countdowns (inactivity, protection) in the open profile
+window.setInterval(() => {
+  if (selected >= 0 && !profile.hidden && mode === 'shared') updateProfileStatus(selected);
+}, 1000);
 net.onError = (code, message) => {
   if (joinDialog.open) joinError.textContent = message;
   else toast(message);
@@ -563,6 +618,7 @@ if (import.meta.env.DEV || params.has('test')) {
     centroid: (id) => (map ? [map.centroids[id * 3], map.centroids[id * 3 + 1], map.centroids[id * 3 + 2]] : [0, 0, 0]),
     neighbors: (id) => (map ? map.neighbors[id] : []),
     owners: () => net.countries.map((c) => c.owner),
+    net: () => ({ status: net.status, you: net.you, nations: [...net.nations.values()], countries: net.countries }),
   };
 }
 
