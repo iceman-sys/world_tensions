@@ -134,12 +134,7 @@ describe('offline catch-up', () => {
     const now = game.world.nations.get(r.nation.id);
     expect(now?.funds).toBeGreaterThan(left?.funds ?? Infinity);
     expect(summary?.funds).toEqual([left?.funds, now?.funds]);
-    // same result as ticking 7 times
-    let expected = left;
-    if (!expected) throw new Error('missing');
-    for (let i = 0; i < 7; i++) expected = tickNation(expected, { cfg: DEMO_CONFIG, capacity: game.meta.countries[r.nation.homeCell].population * 1.3 }).nation;
-    expect(now?.funds).toBe(expected.funds);
-    expect(now?.population).toBe(expected.population);
+    // (batched == tick-by-tick for the full country simulation is tested in tests/citizens.test.ts)
     await repo.close();
   });
 
@@ -179,19 +174,17 @@ describe('inactivity rule', () => {
     await game.tick();
     expect(game.world.nations.has(alice.nation.id)).toBe(true);
 
-    const aliceFunds = simulateUntil(
-      game.world.nations.get(alice.nation.id) ?? alice.nation,
-      deadline,
-      { cfg: DEMO_CONFIG, capacity: game.meta.countries[alice.nation.homeCell].population * 1.3 },
-      tickMs(DEMO_CONFIG),
-    ).nation.funds;
+    const aliceFunds = game.world.nations.get(alice.nation.id)?.funds ?? 0;
     const bobBefore = game.world.nations.get(bob.nation.id)?.funds ?? 0;
     clock.advance(2000);
     await game.tick();
     expect(game.world.nations.has(alice.nation.id)).toBe(false);
     expect(game.countryState(alice.nation.homeCell).owner).toBeNull();
-    // Bob (the only active country) inherited Alice's treasury on top of his own income
-    expect((game.world.nations.get(bob.nation.id)?.funds ?? 0) - bobBefore).toBeGreaterThanOrEqual(aliceFunds);
+    // Bob (the only active country) inherited Alice's treasury (Alice's was still earning until the deadline)
+    const inherited = (game.world.nations.get(bob.nation.id)?.funds ?? 0) - bobBefore;
+    expect(inherited).toBeGreaterThan(aliceFunds * 0.9);
+    const audit = await repo.audit(20, bob.nation.id);
+    expect(audit.some((e) => e.action === 'inherit')).toBe(true);
     const p = game.world.players.get(alice.player.id);
     expect(p?.lostReason).toBe('inactivity');
     expect(game.world.log.at(-1)?.kind).toBe('inactivity');

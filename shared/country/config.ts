@@ -32,6 +32,72 @@ export const TERRAIN = {
   steepSlope: 1.6,
 } as const;
 
+/**
+ * Country simulation (shared/country/sim.ts). The local town is a representative
+ * model of the whole country: building capacities are scaled by the country's
+ * founding population so the starter town covers it at the ratios below.
+ */
+export const SIM = {
+  /** starter-town housing covers this share of the founding population */
+  starterHousingCover: 1.05,
+  /** share of the population that works */
+  workforceShare: 0.55,
+  /** starter-town jobs cover this share of the workforce */
+  starterJobsCover: 0.85,
+  /** food units per game hour consumed at the founding population */
+  foodDemand: 30,
+  /** food stock a new country starts with (game hours of demand) */
+  startingFoodHours: 24,
+  /** extra food per game hour for each food natural resource (Grain, Rice, Fish, Livestock, Cocoa, Coffee) */
+  naturalFood: 6,
+  /** service capacity needed at the founding population for full coverage */
+  need: { education: 120, health: 100, safety: 140, leisure: 60 },
+  /** safety without any police */
+  baseSafety: 0.5,
+  // ---- satisfaction target (0..100) ----
+  baseSatisfaction: 50,
+  /** points lost per tax percent above taxNeutral (gained below) */
+  taxNeutral: 25,
+  taxSlope: 0.9,
+  /** extra, steeper penalty above taxHarsh: (tax - taxHarsh)^1.5 x taxHarshSlope */
+  taxHarsh: 40,
+  taxHarshSlope: 0.35,
+  housingWeight: 30,
+  jobsWeight: 40,
+  /** employment considered normal */
+  jobsNormal: 0.9,
+  shortagePenalty: 18,
+  surplusBonus: 3,
+  safetyWeight: 14,
+  serviceWeights: { education: 4, health: 5, leisure: 4 },
+  /** cap on the sum of building satisfaction bonuses */
+  buildingBonusCap: 8,
+  /** satisfaction eases towards the target by this fraction of the gap per game hour */
+  satisfactionRate: 0.06,
+  /** below this satisfaction people emigrate: population falls by up to migrationRate per game hour */
+  migrationBelow: 25,
+  migrationRate: 0.004,
+  /** inbox warnings when satisfaction falls to these levels */
+  warningStages: [40, 30, 25] as const,
+  /** at or below this for overthrowTicks consecutive ticks, the government falls */
+  overthrowAt: 20,
+  overthrowTicks: 36,
+  // ---- featured citizens ----
+  featuredCount: 40,
+  complainBelow: 45,
+  protestBelow: 35,
+  migrateBelow: 25,
+  /** consecutive ticks below migrateBelow before a citizen plans to leave / actually leaves */
+  migratePlanTicks: 6,
+  migrateLeaveTicks: 48,
+  /** citizen happiness eases towards its target by this fraction per game hour */
+  happinessRate: 0.12,
+  /** citizen years that pass per game day */
+  yearsPerGameDay: 1,
+  retireAge: 67,
+  historyLength: 12,
+} as const;
+
 /** mask values per tile */
 export const MASK = { own: 0, channel: 1, neighbor: 2, outside: 3 } as const;
 /** water values per tile */

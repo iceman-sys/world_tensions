@@ -1,9 +1,10 @@
-import type { AuditEntry, InboxItem, InboxKind, LogEntry, LogKind, Nation, PlayerRec, SessionRec } from '../../shared/model.ts';
+import type { AuditEntry, InboxItem, InboxKind, LogEntry, LogKind, Nation, NewsItem, PlayerRec, SessionRec } from '../../shared/model.ts';
+import type { Citizen } from '../../shared/country/citizens.ts';
 import type { Building } from '../../shared/country/buildings.ts';
 import { COUNTRY_COUNT } from '../../shared/resources.ts';
-import { INBOX_MEMORY, LOG_MEMORY, type ChangeSet, type WorldSnapshot } from './db/repository.ts';
+import { INBOX_MEMORY, LOG_MEMORY, NEWS_MEMORY, type ChangeSet, type WorldSnapshot } from './db/repository.ts';
 
-export type SeqKind = 'nation' | 'log' | 'audit' | 'inbox' | 'building';
+export type SeqKind = 'nation' | 'log' | 'audit' | 'inbox' | 'building' | 'news';
 
 /**
  * In-memory authoritative world. It is only ever modified through `apply`, with
@@ -20,6 +21,10 @@ export class World {
   log: LogEntry[] = [];
   readonly inbox = new Map<string, InboxItem[]>();
   readonly buildings = new Map<number, Building>();
+  /** featured citizens per nation */
+  readonly citizens = new Map<number, Citizen[]>();
+  /** recent country news per nation (oldest first) */
+  readonly news = new Map<number, NewsItem[]>();
 
   static fromSnapshot(s: WorldSnapshot): World {
     const w = new World();
@@ -31,6 +36,8 @@ export class World {
     w.log = s.log.slice(-LOG_MEMORY);
     for (const m of s.inbox) w.pushInbox(m);
     for (const b of s.buildings) w.buildings.set(b.id, b);
+    for (const [nid, list] of s.citizens) w.citizens.set(nid, list);
+    for (const item of s.news) w.pushNews(item);
     return w;
   }
 
@@ -49,6 +56,8 @@ export class World {
     }
     for (const n of cs.nations ?? []) this.nations.set(n.id, n);
     for (const [cell, nation] of cs.territory ?? []) this.territory[cell] = nation ?? -1;
+    for (const [nid, list] of cs.citizens ?? []) this.citizens.set(nid, list);
+    for (const item of cs.news ?? []) this.pushNews(item);
     for (const b of cs.buildings ?? []) this.buildings.set(b.id, b);
     for (const id of cs.deleteBuildings ?? []) this.buildings.delete(id);
     for (const id of cs.deleteNations ?? []) {
@@ -56,6 +65,8 @@ export class World {
       for (let c = 0; c < COUNTRY_COUNT; c++) if (this.territory[c] === id) this.territory[c] = -1;
       // the database cascades; mirror it in memory
       for (const [bid, b] of this.buildings) if (b.nationId === id) this.buildings.delete(bid);
+      this.citizens.delete(id);
+      this.news.delete(id);
     }
     for (const id of cs.deletePlayers ?? []) {
       this.players.delete(id);
@@ -67,6 +78,13 @@ export class World {
       if (this.log.length > LOG_MEMORY) this.log = this.log.slice(-LOG_MEMORY);
     }
     for (const m of cs.inbox ?? []) this.pushInbox(m);
+  }
+
+  private pushNews(item: NewsItem): void {
+    const list = this.news.get(item.nationId) ?? [];
+    list.push(item);
+    if (list.length > NEWS_MEMORY) list.splice(0, list.length - NEWS_MEMORY);
+    this.news.set(item.nationId, list);
   }
 
   private pushInbox(m: InboxItem): void {
@@ -122,6 +140,8 @@ export class Changes {
   private readonly inbox: InboxItem[] = [];
   private readonly buildings = new Map<number, Building>();
   private readonly deleteBuildings: number[] = [];
+  private readonly citizens = new Map<number, Citizen[]>();
+  private readonly news: NewsItem[] = [];
   private readonly seqs = new Map<SeqKind, number>();
 
   constructor(private readonly world: World, private readonly now: number) {}
@@ -212,6 +232,18 @@ export class Changes {
     return [...out.values()];
   }
 
+  citizensOf(nationId: number): Citizen[] {
+    return this.citizens.get(nationId) ?? this.world.citizens.get(nationId) ?? [];
+  }
+
+  putCitizens(nationId: number, list: Citizen[]): void {
+    this.citizens.set(nationId, list);
+  }
+
+  addNews(nationId: number, text: string, at = this.now, kind: NewsItem['kind'] = 'fact'): void {
+    this.news.push({ id: this.nextId('news'), nationId, at, kind, text });
+  }
+
   putBuilding(b: Building): void {
     this.buildings.set(b.id, b);
   }
@@ -231,7 +263,7 @@ export class Changes {
     return (
       !this.players.size && !this.nations.size && !this.territory.size && !this.sessions.length && !this.deleteSessionsOf.length &&
       !this.deleteNations.length && !this.deletePlayers.length && !Object.keys(this.meta).length && !this.log.length &&
-      !this.audit.length && !this.inbox.length && !this.buildings.size && !this.deleteBuildings.length
+      !this.audit.length && !this.inbox.length && !this.buildings.size && !this.deleteBuildings.length && !this.citizens.size && !this.news.length
     );
   }
 
@@ -250,6 +282,8 @@ export class Changes {
       inbox: this.inbox,
       buildings: [...this.buildings.values()],
       deleteBuildings: this.deleteBuildings,
+      citizens: [...this.citizens.entries()].filter(([nid]) => !this.deleteNations.includes(nid)),
+      news: this.news.filter((e) => !this.deleteNations.includes(e.nationId)),
     };
   }
 }

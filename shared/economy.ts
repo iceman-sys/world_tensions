@@ -8,6 +8,7 @@ import { protectionMs } from './config.ts';
 import type { Nation, ResourceAmounts } from './model.ts';
 import { deriveSeed, mulberry32, randInt } from './rng.ts';
 import { STARTING_FUNDS, type ResourceName } from './resources.ts';
+import { SIM } from './country/config.ts';
 
 export const ECONOMY = {
   /** taxable income per citizen per game hour, in dollars */
@@ -76,7 +77,11 @@ export function foundNation(args: {
     lastTickAt: now,
     lowSatTicks: 0,
     warnStage: 0,
-    history: { funds: [STARTING_FUNDS], population: [meta.population], satisfaction: [meta.satisfaction] },
+    history: { funds: [STARTING_FUNDS], population: [meta.population], satisfaction: [meta.satisfaction], employment: [] },
+    food: SIM.foodDemand * SIM.startingFoodHours,
+    services: { health: true, education: true, police: true },
+    announcement: null,
+    stats: null,
   };
 }
 
@@ -93,7 +98,7 @@ export interface TickResult {
   events: TickEvent[];
 }
 
-function pushCapped(list: number[], v: number): number[] {
+export function pushCapped(list: number[], v: number): number[] {
   const out = list.length >= ECONOMY.historyLength ? list.slice(list.length - ECONOMY.historyLength + 1) : list.slice();
   out.push(v);
   return out;
@@ -118,6 +123,7 @@ export function tickNation(n: Nation, ctx: TickContext): TickResult {
     stock,
     population,
     history: {
+      ...n.history,
       funds: pushCapped(n.history.funds, funds),
       population: pushCapped(n.history.population, population),
       satisfaction: pushCapped(n.history.satisfaction, n.satisfaction),

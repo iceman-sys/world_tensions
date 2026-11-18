@@ -7,6 +7,7 @@ import { terrainInputFor, type LocalTerrain } from '../../../shared/country/terr
 import { BUILDINGS, constructionMs, type BuildingKind } from '../../../shared/country/buildings.ts';
 import { CountryView, type CountryStats } from './view.ts';
 import { BuildMenu } from './buildMenu.ts';
+import { CitizenCard } from './citizenCard.ts';
 import { placementText, type PlacementHint } from './placement.ts';
 import { formatMoney } from '../ui/format.ts';
 
@@ -47,16 +48,57 @@ export class CountryController {
   private readonly labels: HTMLElement;
   private readonly hint: HTMLElement;
   private menu: BuildMenu | null = null;
+  private readonly card: CitizenCard;
+  /** test/dev override of the hour of day (null = follow the server's game clock) */
+  hourOverride: number | null = null;
 
   constructor(private readonly deps: CountryControllerDeps) {
     this.fade = document.getElementById('country-fade') as HTMLElement;
     this.labels = document.getElementById('country-labels') as HTMLElement;
     this.hint = document.getElementById('build-hint') as HTMLElement;
     const { net } = deps;
-    net.onLocal = () => this.view?.setBuildings([...net.localBuildings.values()]);
+    this.card = new CitizenCard(document.getElementById('citizen-card') as HTMLElement, (id) => this.buildingLabel(id));
+    this.card.onAsk = (id, q) => net.ask(id, q);
+    this.card.onJudge = (id, verdict) => net.judge(id, verdict);
+    net.onLocal = () => {
+      this.view?.setBuildings([...net.localBuildings.values()]);
+      this.refreshCrowd();
+    };
+    net.onCitizens = () => {
+      this.refreshCrowd();
+      this.card.update(net.citizens);
+    };
+    net.onLocalStats = () => this.refreshCrowd();
+    net.onAnswer = (id, q, text) => this.card.answer(id, q, text);
+    net.onActionResult = (_ok, message) => deps.toast(message);
     net.onBuildResult = (ok, message) => {
       if (!ok) deps.toast(message);
     };
+  }
+
+  private buildingLabel(id: number | null): string | null {
+    const b = id === null ? undefined : this.deps.net.localBuildings.get(id);
+    return b ? BUILDINGS[b.kind].label.toLowerCase() : null;
+  }
+
+  /** The crowd follows the server's citizens and mood. */
+  private refreshCrowd(): void {
+    const { net } = this.deps;
+    const n = net.myNation();
+    this.view?.setCrowd([...net.localBuildings.values()], {
+      population: n?.population ?? 0,
+      satisfaction: n?.satisfaction ?? 50,
+      stats: net.localStats,
+      citizens: net.citizens,
+    });
+  }
+
+  /** Hour of the game day from the server clock (DEMO_MODE: one game day = 24 real minutes). */
+  gameHour(): number {
+    if (this.hourOverride !== null) return this.hourOverride;
+    const scale = this.deps.net.config?.timeScale ?? 1;
+    const gameMs = this.deps.net.serverNow() * scale;
+    return (gameMs / 3_600_000) % 24;
   }
 
   /** Real milliseconds a construction takes on this server. */
@@ -87,6 +129,10 @@ export class CountryController {
     const placing = this.view.placement?.active ?? false;
     if (e.key === 'Escape' && placing) {
       this.menu?.select(null);
+      return true;
+    }
+    if (e.key === 'Escape' && this.card.open) {
+      this.card.close();
       return true;
     }
     if ((e.key === 'r' || e.key === 'R') && placing) {
@@ -180,12 +226,21 @@ export class CountryController {
           this.menu?.select(null);
         },
         onHint: (h) => this.showHint(h),
+        gameHour: () => this.gameHour(),
+        citizenName: (id) => this.deps.net.citizens.find((c) => c.id === id)?.name ?? null,
+        onCitizenClick: (id) => {
+          const c = this.deps.net.citizens.find((x) => x.id === id);
+          if (c) this.card.show(c);
+        },
       });
       globe.suspend();
       view.start(globe.canvas);
       view.playIntro(INTRO_MS);
       this.view = view;
-      if (this.deps.net.localBuildings.size) view.setBuildings([...this.deps.net.localBuildings.values()]);
+      if (this.deps.net.localBuildings.size) {
+        view.setBuildings([...this.deps.net.localBuildings.values()]);
+        this.refreshCrowd();
+      }
       this.deps.net.openLocal();
       const menuRoot = document.getElementById('build-menu');
       const tip = document.getElementById('build-tip');
@@ -218,6 +273,7 @@ export class CountryController {
     this.menu?.select(null);
     this.menu = null;
     this.hint.hidden = true;
+    if (this.card.open) this.card.close();
     this.deps.net.closeLocal();
     this.view.dispose(globe.canvas);
     this.view = null;
@@ -257,6 +313,26 @@ export class CountryController {
   /** Test hook. */
   setOrbit(az: number, polar: number, dist: number): void {
     this.view?.setOrbit(az, polar, dist);
+  }
+
+  /** Test hooks for the citizen scenes. */
+  citizenScreen(id: number): { x: number; y: number } | null {
+    return this.view?.citizenScreen(id) ?? null;
+  }
+
+  openCitizen(id: number): boolean {
+    const c = this.deps.net.citizens.find((x) => x.id === id);
+    if (!c) return false;
+    this.card.show(c);
+    return true;
+  }
+
+  lookAt(x: number, z: number, dist: number): void {
+    this.view?.lookAt(x, z, dist);
+  }
+
+  crowdCounts(): { agents: number; protesters: number; queue: number } {
+    return this.view?.crowdCounts() ?? { agents: 0, protesters: 0, queue: 0 };
   }
 
   /** Test hook. */

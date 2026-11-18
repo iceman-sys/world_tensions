@@ -4,8 +4,9 @@
  * to implement load + atomic commit. SQLite implements it today; a PostgreSQL
  * adapter would implement the same interface (see README, "Path to production").
  */
-import type { AuditEntry, InboxItem, LogEntry, Nation, PlayerRec, SessionRec } from '../../../shared/model.ts';
+import type { AuditEntry, InboxItem, LogEntry, Nation, NewsItem, PlayerRec, SessionRec } from '../../../shared/model.ts';
 import type { Building } from '../../../shared/country/buildings.ts';
+import type { Citizen } from '../../../shared/country/citizens.ts';
 
 export interface ChangeSet {
   meta?: Record<string, string>;
@@ -23,6 +24,9 @@ export interface ChangeSet {
   inbox?: InboxItem[];
   buildings?: Building[];
   deleteBuildings?: number[];
+  /** [nationId, featured citizens] (replaces the nation's list) */
+  citizens?: [number, Citizen[]][];
+  news?: NewsItem[];
 }
 
 export interface WorldSnapshot {
@@ -37,6 +41,9 @@ export interface WorldSnapshot {
   /** most recent inbox items per player, oldest first */
   inbox: InboxItem[];
   buildings: Building[];
+  citizens: Map<number, Citizen[]>;
+  /** most recent country news per nation, oldest first */
+  news: NewsItem[];
 }
 
 export interface Repository {
@@ -51,3 +58,4 @@ export interface Repository {
 
 export const LOG_MEMORY = 300;
 export const INBOX_MEMORY = 100;
+export const NEWS_MEMORY = 40;

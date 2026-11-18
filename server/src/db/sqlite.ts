@@ -3,8 +3,12 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { AuditEntry, InboxItem, InboxKind, LogEntry, LogKind, LostReason, Nation, NationHistory, PlayerRec, ResourceAmounts, SessionRec } from '../../../shared/model.ts';
 import { COUNTRY_COUNT, RESOURCE_CATALOG, type ResourceName } from '../../../shared/resources.ts';
-import { INBOX_MEMORY, LOG_MEMORY, type ChangeSet, type Repository, type WorldSnapshot } from './repository.ts';
+import { INBOX_MEMORY, LOG_MEMORY, NEWS_MEMORY, type ChangeSet, type Repository, type WorldSnapshot } from './repository.ts';
+import type { NewsItem } from '../../../shared/model.ts';
 import { BUILDING_KINDS, type Building, type BuildingKind } from '../../../shared/country/buildings.ts';
+import type { Services, TownStats } from '../../../shared/model.ts';
+import { SIM } from '../../../shared/country/config.ts';
+import type { Citizen } from '../../../shared/country/citizens.ts';
 
 /** Ordered schema migrations; PRAGMA user_version records how many have run. */
 const MIGRATIONS: string[] = [
@@ -141,14 +145,37 @@ const MIGRATIONS: string[] = [
   CREATE INDEX buildings_country ON buildings(country_id);
   ALTER TABLE audit_log ADD COLUMN actor_name TEXT NOT NULL DEFAULT '';
   `,
+  /* sql */ `
+  ALTER TABLE countries ADD COLUMN extra TEXT NOT NULL DEFAULT '{}';
+  CREATE TABLE citizens (
+    country_id INTEGER PRIMARY KEY REFERENCES countries(id) ON DELETE CASCADE,
+    data TEXT NOT NULL
+  );
+  CREATE TABLE news (
+    id INTEGER PRIMARY KEY,
+    country_id INTEGER NOT NULL REFERENCES countries(id) ON DELETE CASCADE,
+    at INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    text TEXT NOT NULL
+  );
+  CREATE INDEX news_country ON news(country_id, id);
+  `,
 ];
+
+/** Country-view fields of a nation, stored as one JSON column. */
+interface NationExtra {
+  food?: number;
+  services?: Services;
+  announcement?: { id: string; until: number } | null;
+  stats?: TownStats | null;
+}
 
 interface PlayerRow { id: string; name: string; bot: number; created_at: number; last_seen: number; country_id: number | null; away: string | null; lost_reason: string | null }
 interface SessionRow { token_hash: string; player_id: string; created_at: number; last_used_at: number }
 interface CountryRow {
   id: number; player_id: string; home_cell: number; funds: number; population: number; satisfaction: number; tax_rate: number;
   military_size: number; military_readiness: number; created_at: number; protected_until: number; last_active_at: number;
-  last_tick_at: number; low_sat_ticks: number; warn_stage: number; history: string;
+  last_tick_at: number; low_sat_ticks: number; warn_stage: number; history: string; extra: string;
 }
 interface ResourceRow { country_id: number; resource: string; stock: number; production: number }
 interface LogRow { id: number; at: number; kind: string; text: string; cells: string }
@@ -223,8 +250,9 @@ export class SqliteRepository implements Repository {
       stock.set(r.country_id, s);
       production.set(r.country_id, p);
     }
-    const nations = db.prepare<[], CountryRow>('SELECT * FROM countries').all().map(
-      (r): Nation => ({
+    const nations = db.prepare<[], CountryRow>('SELECT * FROM countries').all().map((r): Nation => {
+      const extra = parseJson<NationExtra>(r.extra, {});
+      return {
         id: r.id,
         playerId: r.player_id,
         homeCell: r.home_cell,
@@ -242,8 +270,18 @@ export class SqliteRepository implements Repository {
         lowSatTicks: r.low_sat_ticks,
         warnStage: r.warn_stage,
         history: parseJson<NationHistory>(r.history, { funds: [], population: [], satisfaction: [] }),
-      }),
-    );
+        // nations from before the country view get sensible defaults
+        food: typeof extra.food === 'number' ? extra.food : SIM.foodDemand * SIM.startingFoodHours,
+        services: extra.services ?? { health: true, education: true, police: true },
+        announcement: extra.announcement ?? null,
+        stats: extra.stats ?? null,
+      };
+    });
+
+    const citizens = new Map<number, Citizen[]>();
+    for (const r of db.prepare<[], { country_id: number; data: string }>('SELECT country_id, data FROM citizens').all()) {
+      citizens.set(r.country_id, parseJson<Citizen[]>(r.data, []));
+    }
 
     const territory = new Array<number | null>(COUNTRY_COUNT).fill(null);
     for (const r of db.prepare<[], { cell: number; country_id: number | null }>('SELECT cell, country_id FROM territory').all()) {
@@ -282,7 +320,16 @@ export class SqliteRepository implements Repository {
         }),
       );
 
-    return { meta, players, sessions, nations, territory, log, inbox, buildings };
+    const news = db
+      .prepare<[number], { id: number; country_id: number; at: number; kind: string; text: string }>(
+        `SELECT id, country_id, at, kind, text FROM (
+           SELECT *, ROW_NUMBER() OVER (PARTITION BY country_id ORDER BY id DESC) AS rn FROM news
+         ) WHERE rn <= ? ORDER BY id`,
+      )
+      .all(NEWS_MEMORY)
+      .map((r): NewsItem => ({ id: r.id, nationId: r.country_id, at: r.at, kind: r.kind === 'flavor' ? 'flavor' : 'fact', text: r.text }));
+
+    return { meta, players, sessions, nations, territory, log, inbox, buildings, citizens, news };
   }
 
   async commit(cs: ChangeSet): Promise<void> {
@@ -335,14 +382,14 @@ export class SqliteRepository implements Repository {
       if (cs.nations?.length) {
         const st = db.prepare(
           `INSERT INTO countries (id, player_id, home_cell, funds, population, satisfaction, tax_rate, military_size, military_readiness,
-             created_at, protected_until, last_active_at, last_tick_at, low_sat_ticks, warn_stage, history)
+             created_at, protected_until, last_active_at, last_tick_at, low_sat_ticks, warn_stage, history, extra)
            VALUES (@id, @player_id, @home_cell, @funds, @population, @satisfaction, @tax_rate, @military_size, @military_readiness,
-             @created_at, @protected_until, @last_active_at, @last_tick_at, @low_sat_ticks, @warn_stage, @history)
+             @created_at, @protected_until, @last_active_at, @last_tick_at, @low_sat_ticks, @warn_stage, @history, @extra)
            ON CONFLICT(id) DO UPDATE SET player_id = excluded.player_id, home_cell = excluded.home_cell, funds = excluded.funds,
              population = excluded.population, satisfaction = excluded.satisfaction, tax_rate = excluded.tax_rate,
              military_size = excluded.military_size, military_readiness = excluded.military_readiness,
              protected_until = excluded.protected_until, last_active_at = excluded.last_active_at, last_tick_at = excluded.last_tick_at,
-             low_sat_ticks = excluded.low_sat_ticks, warn_stage = excluded.warn_stage, history = excluded.history`,
+             low_sat_ticks = excluded.low_sat_ticks, warn_stage = excluded.warn_stage, history = excluded.history, extra = excluded.extra`,
         );
         const delRes = db.prepare('DELETE FROM country_resources WHERE country_id = ?');
         const insRes = db.prepare('INSERT INTO country_resources (country_id, resource, stock, production) VALUES (?, ?, ?, ?)');
@@ -364,6 +411,7 @@ export class SqliteRepository implements Repository {
             low_sat_ticks: n.lowSatTicks,
             warn_stage: n.warnStage,
             history: JSON.stringify(n.history),
+            extra: JSON.stringify({ food: n.food, services: n.services, announcement: n.announcement, stats: n.stats } satisfies NationExtra),
           });
           delRes.run(n.id);
           const names = new Set<string>([...Object.keys(n.stock), ...Object.keys(n.production)]);
@@ -403,6 +451,14 @@ export class SqliteRepository implements Repository {
       if (cs.deleteBuildings?.length) {
         const st = db.prepare('DELETE FROM buildings WHERE id = ?');
         for (const id of cs.deleteBuildings) st.run(id);
+      }
+      if (cs.news?.length) {
+        const st = db.prepare('INSERT INTO news (id, country_id, at, kind, text) VALUES (?, ?, ?, ?, ?)');
+        for (const e of cs.news) st.run(e.id, e.nationId, e.at, e.kind, e.text);
+      }
+      if (cs.citizens?.length) {
+        const st = db.prepare('INSERT INTO citizens (country_id, data) VALUES (?, ?) ON CONFLICT(country_id) DO UPDATE SET data = excluded.data');
+        for (const [nid, list] of cs.citizens) st.run(nid, JSON.stringify(list));
       }
       if (cs.inbox?.length) {
         const st = db.prepare('INSERT INTO inbox (id, player_id, at, kind, title, body) VALUES (?, ?, ?, ?, ?, ?)');

@@ -84,9 +84,9 @@ export function createGameServer(game: Game, opts: NetOptions): GameServer {
         broadcast({ t: 'diff', countries: d.countries, nations: d.nations, removedNations: d.removedNations, counts: game.counts(), now: Date.now() });
       }
       if (d.log.length) broadcast({ t: 'log', entries: d.log });
-      for (const [nationId, local] of game.drainLocal()) {
-        sendToNation(nationId, { t: 'local:diff', nationId, buildings: local.buildings, removed: local.removed, now: Date.now() });
-      }
+      for (const [nationId, diff] of game.drainLocal()) sendToNation(nationId, { t: 'local:diff', nationId, diff, now: Date.now() });
+      // throttled citizen updates still waiting: flush again shortly
+      if (game.hasPendingLocal) game.onDirty?.();
     }, 100);
   };
   game.onPlayerChanged = (playerId) => {
@@ -179,6 +179,21 @@ export function createGameServer(game: Game, opts: NetOptions): GameServer {
         if (!c.playerId) return error(c, 'no-country', 'Join the Earth first.');
         const r = await game.cancelBuild(c.playerId, msg.id);
         send(c, { t: 'build:result', ok: r.ok, message: r.ok ? 'Construction cancelled.' : r.message, buildingId: r.ok ? r.building.id : null });
+        return;
+      }
+      case 'citizen:ask': {
+        if (!c.playerId) return error(c, 'no-country', 'Join the Earth first.');
+        const text = await game.askCitizen(c.playerId, msg.id, msg.q);
+        // another nation's citizen is indistinguishable from a missing one
+        if (text === null) return send(c, { t: 'action:result', ok: false, message: 'No such citizen.' });
+        send(c, { t: 'citizen:answer', id: msg.id, q: msg.q, text });
+        return;
+      }
+      case 'citizen:release':
+      case 'citizen:exile': {
+        if (!c.playerId) return error(c, 'no-country', 'Join the Earth first.');
+        const r = await game.judgeCitizen(c.playerId, msg.id, msg.t === 'citizen:release' ? 'release' : 'exile');
+        send(c, { t: 'action:result', ok: r.ok, message: r.message });
         return;
       }
     }

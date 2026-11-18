@@ -156,6 +156,111 @@ spiral around the capital (farms at least 8 tiles out). The layout is determinis
 - Construction sites grow from the ground with a scaffold and an HTML progress ring.
 - Trees under or next to buildings are hidden.
 
+## Country simulation (`shared/country/sim.ts`)
+
+The town is a **representative model** of the whole country. Building capacities
+are scaled by the country's founding population, so the starter town covers it
+at the reference ratios. Building more raises coverage proportionally. Every
+tick (5 game minutes) the server computes:
+
+| Aggregate | Rule |
+|---|---|
+| Housing capacity | homes ÷ starter homes × **1.05** × founding population (population grows towards it) |
+| Workforce / jobs | workforce = **55 %** of the population; jobs = jobs ÷ starter jobs × **0.85** × founding workforce |
+| Employment | jobs ÷ workforce (0–100 %) |
+| Tax income | the economy core's income × (0.5 + 0.5 × employment) |
+| Upkeep | sum of finished buildings' upkeep (services switched off cost nothing) |
+| Food | farms + markets + **6/h** per food resource (Grain, Rice, Fish, Livestock, Cocoa, Coffee) − **30/h** × population ÷ founding population. A **shortage** is an empty store with a negative balance. Countries start with 24 h of food. |
+| Safety | 0.5 + police coverage × 0.5 (coverage = capacity ÷ (need × population ratio), needs: safety 140, education 120, health 100, leisure 60) |
+
+**Satisfaction target** (0–100):
+
+```
+50
+− taxPenalty            (tax − 25) × 0.9  +  max(0, tax − 40)^1.5 × 0.35
++ housing               clamp((housing − 1) × 30, −20, +3)
++ jobs                  clamp((employment − 0.9) × 40, −20, +4)
++ food                  −18 in a shortage, +3 with a surplus
++ safety                (safety − 0.5) × 14
++ services              education × 4 + health × 5 + leisure × 4
++ buildings             sum of building satisfaction bonuses (max +8)
++ announcement          while a policy announcement is active
+```
+
+Satisfaction moves **6 % of the gap per game hour** towards the target.
+
+- **Migration:** below **25 %** the population shrinks by up to 0.4 % per game hour.
+- **Warnings:** inbox alerts at **40 %, 30 %, 25 %**, each sent once. They re-arm after satisfaction recovers above 45 %.
+- **Uprising:** at or below **20 %** for **36 consecutive ticks** (3 game hours) the citizens overthrow the government. The country is lost through the same rule as inactivity (its assets go to a random active country, logged and audited), and the governor can found a new country. Construction is locked while satisfaction is at or below 20 %.
+
+Offline countries are caught up in one batch; the batch equals tick-by-tick,
+including citizens (tested). Constructions finishing during a long batch count
+from the next tick (simplification).
+
+## Featured citizens (`shared/country/citizens.ts`)
+
+Each country has **40 featured citizens**, generated deterministically from the
+Earth seed and the nation. They are about 20 % children, 65 % working age and
+15 % retired.
+
+**Profile.**
+- name (syllable generator), age, job (from the workplace), take-home income (gross pay × (1 − tax); pensions and benefits are untaxed), education
+- family (partner and children by name), home building
+- **3 traits** from 12, happiness, loyalty, opinion of the government
+- current need, status, notable role, and a life history (last 12 events)
+
+**Each tick** (per-tick RNG seeded by seed, nation and tick time):
+
+| Rule | Detail |
+|---|---|
+| Happiness target | national satisfaction ± traits (frugal: tax; family-oriented: housing and food; ambitious / hard-working: jobs; cautious / worried: safety; cheerful +6; grumpy −6; …) − 12 if unemployed − 10 if homeless; eases at 12 % of the gap per game hour |
+| Opinion | (happiness − 50) × 1.6 + (loyalty − 50) × 0.6, clamped to ±100 |
+| **Status** | complaining < **45**, protesting < **35**, planning to move after **6** ticks < **25**, **leaves** after **48** ticks < 25 |
+| Life events | aging (1 year per game day), retirement at 67, finishing school at 18, getting or losing a job (by employment), a new home, children (partner, age 22–44, happy, no shortage), "Lost income after the tax rose to X %" when the tax changes by 5 or more points |
+| Newcomers | when satisfaction > 55 and housing ≥ 0.95 |
+| Justice | a citizen can be **detained** only under real hardship: age 16+, happiness < 30, and a food shortage or safety < 0.45 |
+
+**Justice decisions** (governor; audited with their name):
+
+| Decision | Effect |
+|---|---|
+| Release | citizen loyalty +10, happiness +5; country satisfaction **+0.5** |
+| Exile | citizen removed; country satisfaction **−1.5** |
+
+## Conversations (`shared/country/dialogue.ts`)
+
+There is **no free-text input**. The client sends a preset question id; the
+protocol validator rejects anything else. The questions are:
+- How are you feeling?
+- Do you have enough food?
+- What do you think about taxes?
+- Do you have a good job?
+- Would you consider moving away?
+- How is your home?
+- Do you feel safe?
+
+The server answers with `TemplateBackend`, which composes mild sentences from the
+citizen's traits and the **real** state: the exact tax rate and take-home pay,
+whether food is short or running down, the employment rate, the citizen's home
+and workplace, and police coverage. A different source (e.g. a language model)
+can implement `DialogueBackend`, but only templates ship.
+
+## Crowd rendering (`client/src/country/agents.ts`)
+
+- **Count:** visible citizens = clamp(120 + population ÷ 150,000, **150, 300**).
+- **Rendering:** two InstancedMeshes (body, head), plus protest signs, featured markers and a point cloud for distant citizens.
+- **Level of detail:** within camera distance 70 everyone is a figure; between 70 and 150 figures fade into dots; beyond 220 only 60 % are drawn.
+- **Daily routine** (game clock):
+  - leave home at 6–7:36
+  - work until 16–17:30
+  - market or park until 19:30–21:30
+  - home at night; windows glow, and 8 % walk at night
+- **Reactions** (only from server state):
+  - **protest:** the share of featured citizens protesting or planning to move × crowd × 0.6 people gather with signs at the town hall
+  - **food shortage:** a 22-person queue at the market
+  - **mood:** at satisfaction ≥ 65, 75 % spend the evening in the park (40 % at ≥ 45, 15 % below)
+- **Performance:** all buffers are preallocated; `update()` does not allocate.
+
 ## Server authority
 
 Terrain derives only from public data (the Earth seed), the same as the globe, so

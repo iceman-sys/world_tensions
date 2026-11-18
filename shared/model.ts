@@ -18,6 +18,39 @@ export interface NationHistory {
   funds: number[];
   population: number[];
   satisfaction: number[];
+  /** employment %, recorded once the country view simulation runs */
+  employment?: number[];
+}
+
+export interface Services {
+  health: boolean;
+  education: boolean;
+  police: boolean;
+}
+
+/** Aggregates the country simulation computed on the last tick (shown in the country view). */
+export interface TownStats {
+  housingCapacity: number;
+  /** homes / population */
+  housing: number;
+  workforce: number;
+  jobs: number;
+  /** employed / workforce, 0..1 */
+  employment: number;
+  /** food units per game hour: production - demand */
+  foodBalance: number;
+  shortage: boolean;
+  /** 0..1 */
+  safety: number;
+  education: number;
+  health: number;
+  leisure: number;
+  /** satisfaction the country is moving towards */
+  target: number;
+  /** upkeep in dollars per game hour */
+  upkeep: number;
+  /** tax rate when these stats were computed (to notice tax changes) */
+  taxRate: number;
 }
 
 export interface Nation {
@@ -47,6 +80,14 @@ export interface Nation {
   /** highest satisfaction warning stage already sent (0 = none) */
   warnStage: number;
   history: NationHistory;
+  /** food in storage (country view simulation) */
+  food: number;
+  /** public services the government funds */
+  services: Services;
+  /** active policy announcement and when its effect ends */
+  announcement: { id: string; until: number } | null;
+  /** aggregates from the last tick (null until the first tick) */
+  stats: TownStats | null;
 }
 
 export interface AwaySnapshot {
@@ -110,6 +151,18 @@ export interface AuditEntry {
   action: string;
   nationId: number | null;
   detail: string;
+}
+
+/**
+ * Country news: private to the nation, and only ever generated from simulation
+ * events ("fact"). Anything that is not a reported event is labelled "flavor".
+ */
+export interface NewsItem {
+  id: number;
+  nationId: number;
+  at: number;
+  kind: 'fact' | 'flavor';
+  text: string;
 }
 
 export type InboxKind = 'info' | 'warning' | 'danger' | 'trade' | 'war';

@@ -7,6 +7,7 @@ import { buildWater, type WaterUniforms } from './water.ts';
 import { Disposables, buildFlagpole, buildResourceSites, buildTrees, heightAt, type Trees } from './props.ts';
 import { BuildingLayer, placementTransform } from './buildingLayer.ts';
 import { Placement, type PlacementHint } from './placement.ts';
+import { Agents, type CrowdState } from './agents.ts';
 import { footprint, validatePlacement, type Building, type BuildingKind } from '../../../shared/country/buildings.ts';
 
 export interface CountryViewOptions {
@@ -21,6 +22,10 @@ export interface CountryViewOptions {
   funds: () => number;
   onPlace: (kind: BuildingKind, i: number, j: number, rot: 0 | 1) => void;
   onHint: (hint: PlacementHint | null) => void;
+  /** hour of the game day, 0..24 (from the server clock) */
+  gameHour: () => number;
+  citizenName: (id: number) => string | null;
+  onCitizenClick: (id: number) => void;
 }
 
 export interface CountryStats {
@@ -70,6 +75,22 @@ export class CountryView {
   private flagGroup: THREE.Group | null = null;
   private capitalLabel: Label | null = null;
   private serverNow: () => number = () => Date.now();
+  private agents: Agents | null = null;
+  private hemi: THREE.HemisphereLight | null = null;
+  private gameHour: () => number = () => 12;
+  private citizenName: (id: number) => string | null = () => null;
+  private onCitizenClick: (id: number) => void = () => undefined;
+  private nameTag: HTMLDivElement | null = null;
+  private pointer = { x: -1, y: -1, inside: false, downX: 0, downY: 0 };
+  /** 0 (night) .. 1 (full day), for tests and the stats overlay */
+  daylight = 1;
+  private readonly fogColor = new THREE.Color();
+  private readonly night = new THREE.Color('#0c1424');
+  private readonly dusk = new THREE.Color('#e2a27c');
+  private readonly sunDay = new THREE.Color('#fff1dc');
+  private readonly sunDusk = new THREE.Color('#ffb072');
+  private readonly moon = new THREE.Color('#9fb3ff');
+  private readonly tmpColor = new THREE.Color();
 
   constructor(private readonly renderer: THREE.WebGLRenderer, private readonly labelRoot: HTMLElement) {
     this.camera = new THREE.PerspectiveCamera(45, 1, 0.5, 1400);
@@ -84,10 +105,12 @@ export class CountryView {
     this.terrain = t;
     const n = t.size;
     const half = (n - 1) / 2;
-    this.scene.background = FOG;
-    this.scene.fog = new THREE.Fog(FOG, n * 0.9, n * 2.6);
+    // copies: the day/night cycle recolours these every frame
+    this.scene.background = FOG.clone();
+    this.scene.fog = new THREE.Fog(FOG.clone(), n * 0.9, n * 2.6);
 
     const hemi = new THREE.HemisphereLight('#cfe3ff', '#5a5040', 1.1);
+    this.hemi = hemi;
     this.scene.add(hemi);
     this.sun.position.copy(this.sunDir).multiplyScalar(n);
     this.sun.castShadow = true;
@@ -125,6 +148,16 @@ export class CountryView {
     this.placement.onPlace = o.onPlace;
     this.placement.onHint = o.onHint;
     this.scene.add(this.placement.object);
+
+    this.agents = new Agents(t, this.d);
+    this.scene.add(this.agents.group);
+    this.gameHour = o.gameHour;
+    this.citizenName = o.citizenName;
+    this.onCitizenClick = o.onCitizenClick;
+    this.nameTag = document.createElement('div');
+    this.nameTag.className = 'cv-nametag';
+    this.nameTag.hidden = true;
+    this.labelRoot.appendChild(this.nameTag);
 
     const cap = tileToWorld(n, t.capital.i, t.capital.j);
     const capY = heightAt(t, cap.x, cap.z);
@@ -207,6 +240,103 @@ export class CountryView {
     return null;
   }
 
+  /** Updates the crowd from the server's buildings, citizens and mood. */
+  setCrowd(buildings: readonly Building[], crowd: CrowdState): void {
+    this.agents?.setState(buildings, crowd);
+  }
+
+  /** Sun, sky, fog, water and window lights for an hour of the game day. */
+  private applyTimeOfDay(hour: number): void {
+    const angle = ((hour - 6) / 12) * Math.PI;
+    const elev = Math.sin(angle);
+    const day = Math.max(0, Math.min(1, (elev + 0.12) / 0.4));
+    this.daylight = day;
+    const duskAmt = Math.max(0, 1 - Math.abs(elev) / 0.3) * (hour > 3 && hour < 21 ? 1 : 0);
+    // sun (or moon) direction
+    if (elev > -0.05) this.sunDir.set(Math.cos(angle) * 0.85, Math.max(0.12, elev), 0.35).normalize();
+    else this.sunDir.set(-0.4, 0.7, -0.3).normalize();
+    if (this.terrain) this.sun.position.copy(this.sun.target.position).addScaledVector(this.sunDir, this.terrain.size);
+    this.sun.intensity = 0.35 + 2.1 * day;
+    this.sun.color.copy(this.moon).lerp(this.sunDusk, Math.min(1, day * 2)).lerp(this.sunDay, Math.max(0, day * 1.6 - 0.6));
+    if (this.hemi) this.hemi.intensity = 0.3 + 0.85 * day;
+    this.fogColor.copy(this.night).lerp(FOG, day);
+    this.fogColor.lerp(this.tmpColor.copy(this.dusk), duskAmt * 0.45);
+    if (this.scene.fog instanceof THREE.Fog) this.scene.fog.color.copy(this.fogColor);
+    if (this.scene.background instanceof THREE.Color) this.scene.background.copy(this.fogColor);
+    if (this.water) this.water.uNight.value = 1 - day;
+    const glow = this.layer?.windowMaterial;
+    if (glow) glow.emissiveIntensity = (1 - day) * 1.8;
+  }
+
+  private readonly onPointerMove = (e: PointerEvent): void => {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    this.pointer.x = e.clientX - rect.left;
+    this.pointer.y = e.clientY - rect.top;
+    this.pointer.inside = true;
+  };
+
+  private readonly onPointerLeave = (): void => {
+    this.pointer.inside = false;
+  };
+
+  private readonly onPointerDown = (e: PointerEvent): void => {
+    this.pointer.downX = e.clientX;
+    this.pointer.downY = e.clientY;
+  };
+
+  private readonly onPointerUp = (e: PointerEvent): void => {
+    if (e.button !== 0 || this.placement?.active || !this.agents) return;
+    if (Math.hypot(e.clientX - this.pointer.downX, e.clientY - this.pointer.downY) > 6) return;
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const id = this.agents.pick(this.camera, rect.width, rect.height, e.clientX - rect.left, e.clientY - rect.top, 18);
+    if (id) this.onCitizenClick(id);
+  };
+
+  /** Hover: highlight and name tag for the featured citizen under the pointer. */
+  private updateHover(): void {
+    const tag = this.nameTag;
+    if (!this.agents || !tag) return;
+    const el = this.renderer.domElement;
+    const id = this.pointer.inside && !this.placement?.active ? this.agents.pick(this.camera, el.clientWidth, el.clientHeight, this.pointer.x, this.pointer.y, 16) : 0;
+    this.agents.hoverId = id;
+    el.style.cursor = this.placement?.active ? 'crosshair' : id ? 'pointer' : '';
+    if (!id || !this.agents.positionOf(id, this.tmp)) {
+      tag.hidden = true;
+      return;
+    }
+    this.tmp.y += 1.15;
+    this.tmp.project(this.camera);
+    tag.hidden = false;
+    const name = this.citizenName(id) ?? '';
+    if (tag.textContent !== name) tag.textContent = name;
+    tag.style.transform = `translate3d(${((this.tmp.x * 0.5 + 0.5) * el.clientWidth).toFixed(1)}px, ${((-this.tmp.y * 0.5 + 0.5) * el.clientHeight).toFixed(1)}px, 0) translate(-50%, -100%)`;
+  }
+
+  /** Test/dev hook: screen position of a featured citizen (or null when indoors / off screen). */
+  citizenScreen(id: number): { x: number; y: number } | null {
+    if (!this.agents?.positionOf(id, this.tmp)) return null;
+    this.tmp.y += 0.5;
+    this.tmp.project(this.camera);
+    if (this.tmp.z > 1 || Math.abs(this.tmp.x) > 0.9 || Math.abs(this.tmp.y) > 0.8) return null;
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    return { x: rect.left + (this.tmp.x * 0.5 + 0.5) * rect.width, y: rect.top + (-this.tmp.y * 0.5 + 0.5) * rect.height };
+  }
+
+  /** Points the camera at a world position (keeps the current angle). */
+  lookAt(x: number, z: number, distance: number): void {
+    if (!this.controls || !this.terrain) return;
+    const y = heightAt(this.terrain, x, z);
+    const dir = this.tmp.copy(this.camera.position).sub(this.controls.target).normalize();
+    this.controls.target.set(x, y, z);
+    this.camera.position.copy(this.controls.target).addScaledVector(dir, distance);
+    this.camera.lookAt(this.controls.target);
+    this.intro = null;
+  }
+
+  crowdCounts(): { agents: number; protesters: number; queue: number } {
+    return this.agents?.counts() ?? { agents: 0, protesters: 0, queue: 0 };
+  }
+
   startPlacement(kind: BuildingKind | null): void {
     if (kind) this.placement?.start(kind);
     else this.placement?.cancel();
@@ -246,6 +376,10 @@ export class CountryView {
     window.addEventListener('resize', this.resize);
     canvas.addEventListener('webglcontextlost', this.contextLost);
     canvas.addEventListener('webglcontextrestored', this.contextRestored);
+    canvas.addEventListener('pointermove', this.onPointerMove);
+    canvas.addEventListener('pointerleave', this.onPointerLeave);
+    canvas.addEventListener('pointerdown', this.onPointerDown);
+    canvas.addEventListener('pointerup', this.onPointerUp);
     this.lastT = performance.now();
     this.renderer.setAnimationLoop(this.frame);
   }
@@ -320,6 +454,11 @@ export class CountryView {
     this.flagUpdate?.(time);
     const serverNow = this.serverNow();
     this.layer?.updateConstruction(serverNow);
+    const hour = this.gameHour();
+    this.applyTimeOfDay(hour);
+    const dist = controls ? this.camera.position.distanceTo(controls.target) : 100;
+    this.agents?.update(hour, time, dist);
+    this.updateHover();
     this.renderer.render(this.scene, this.camera);
     this.layoutLabels();
     this.layer?.layoutRings(this.camera, this.renderer.domElement.clientWidth, this.renderer.domElement.clientHeight, serverNow);
@@ -378,6 +517,15 @@ export class CountryView {
     window.removeEventListener('resize', this.resize);
     canvas.removeEventListener('webglcontextlost', this.contextLost);
     canvas.removeEventListener('webglcontextrestored', this.contextRestored);
+    canvas.removeEventListener('pointermove', this.onPointerMove);
+    canvas.removeEventListener('pointerleave', this.onPointerLeave);
+    canvas.removeEventListener('pointerdown', this.onPointerDown);
+    canvas.removeEventListener('pointerup', this.onPointerUp);
+    canvas.style.cursor = '';
+    this.nameTag?.remove();
+    this.nameTag = null;
+    this.agents = null;
+    this.hemi = null;
     this.sun.shadow.dispose();
     this.placement?.dispose();
     this.placement = null;

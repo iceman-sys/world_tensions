@@ -1,6 +1,12 @@
 import type { AwaySummary, ClientConfig, ClientMessage, CountryState, EarthCounts, ErrorCode, NationView, ServerMessage, You } from '../../../shared/protocol.ts';
 import type { LogEntry } from '../../../shared/model.ts';
 import type { Building, BuildingKind } from '../../../shared/country/buildings.ts';
+import type { Citizen } from '../../../shared/country/citizens.ts';
+import type { QuestionId } from '../../../shared/country/dialogue.ts';
+import type { NewsItem, TownStats } from '../../../shared/model.ts';
+import type { MyNation } from '../../../shared/protocol.ts';
+
+const NEWS_KEEP = 40;
 import { COUNTRY_COUNT } from '../../../shared/resources.ts';
 
 const emptyCell = (id: number): CountryState => ({ id, owner: null, online: false, lastSeen: 0, bot: false, nationId: null, homeCell: id, lostAt: null });
@@ -57,6 +63,17 @@ export class NetClient {
   localNationId: number | null = null;
   onLocal: ((changed: Building[], removed: number[], full: boolean) => void) | null = null;
   onBuildResult: ((ok: boolean, message: string) => void) | null = null;
+  /** featured citizens of your own nation */
+  citizens: Citizen[] = [];
+  localStats: TownStats | null = null;
+  myNationPrivate: MyNation | null = null;
+  /** your country's news (facts from the simulation) */
+  news: NewsItem[] = [];
+  onLocalStats: (() => void) | null = null;
+  onCitizens: (() => void) | null = null;
+  onNews: ((items: NewsItem[]) => void) | null = null;
+  onAnswer: ((citizenId: number, q: QuestionId, text: string) => void) | null = null;
+  onActionResult: ((ok: boolean, message: string) => void) | null = null;
   private wantLocal = false;
 
   private ws: WebSocket | null = null;
@@ -144,6 +161,10 @@ export class NetClient {
     this.wantLocal = false;
     this.localBuildings.clear();
     this.localNationId = null;
+    this.citizens = [];
+    this.localStats = null;
+    this.myNationPrivate = null;
+    this.news = [];
     this.send({ t: 'local:close' });
   }
 
@@ -153,6 +174,15 @@ export class NetClient {
 
   cancelBuild(id: number): void {
     this.send({ t: 'build:cancel', id });
+  }
+
+  /** Preset questions only: the protocol has no free-text field. */
+  ask(citizenId: number, q: QuestionId): void {
+    this.send({ t: 'citizen:ask', id: citizenId, q });
+  }
+
+  judge(citizenId: number, verdict: 'release' | 'exile'): void {
+    this.send({ t: verdict === 'release' ? 'citizen:release' : 'citizen:exile', id: citizenId });
   }
 
   private send(msg: ClientMessage): void {
@@ -210,22 +240,48 @@ export class NetClient {
       }
       case 'local:state': {
         this.clockOffset = msg.now - Date.now();
-        this.localNationId = msg.state.nationId;
+        const s = msg.state;
+        this.localNationId = s.nationId;
         this.localBuildings.clear();
-        for (const b of msg.state.buildings) this.localBuildings.set(b.id, b);
-        this.onLocal?.(msg.state.buildings, [], true);
+        for (const b of s.buildings) this.localBuildings.set(b.id, b);
+        this.citizens = s.citizens;
+        this.localStats = s.stats;
+        this.myNationPrivate = s.nation;
+        this.news = s.news.slice(-NEWS_KEEP);
+        this.onLocal?.(s.buildings, [], true);
+        this.onLocalStats?.();
+        this.onCitizens?.();
+        this.onNews?.(this.news);
         break;
       }
       case 'local:diff': {
         if (msg.nationId !== this.localNationId) break;
         this.clockOffset = msg.now - Date.now();
-        for (const b of msg.buildings) this.localBuildings.set(b.id, b);
-        for (const id of msg.removed) this.localBuildings.delete(id);
-        this.onLocal?.(msg.buildings, msg.removed, false);
+        const d = msg.diff;
+        for (const b of d.buildings) this.localBuildings.set(b.id, b);
+        for (const id of d.removed) this.localBuildings.delete(id);
+        if (d.buildings.length || d.removed.length) this.onLocal?.(d.buildings, d.removed, false);
+        if (d.stats) this.localStats = d.stats;
+        if (d.nation) this.myNationPrivate = d.nation;
+        if (d.stats || d.nation) this.onLocalStats?.();
+        if (d.citizens) {
+          this.citizens = d.citizens;
+          this.onCitizens?.();
+        }
+        if (d.news.length) {
+          this.news = [...this.news, ...d.news].slice(-NEWS_KEEP);
+          this.onNews?.(d.news);
+        }
         break;
       }
       case 'build:result':
         this.onBuildResult?.(msg.ok, msg.message);
+        break;
+      case 'citizen:answer':
+        this.onAnswer?.(msg.id, msg.q, msg.text);
+        break;
+      case 'action:result':
+        this.onActionResult?.(msg.ok, msg.message);
         break;
       case 'joined':
         this.you = msg.you;

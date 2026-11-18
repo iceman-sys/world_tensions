@@ -1,5 +1,7 @@
 /** Wire protocol between the browser and the authoritative server (JSON over WebSocket). */
-import type { InboxItem, LogEntry, LostReason, Military } from './model.ts';
+import type { InboxItem, LogEntry, LostReason, Military, NationHistory, NewsItem, Services, TownStats } from './model.ts';
+import type { Citizen } from './country/citizens.ts';
+import { QUESTION_IDS, type QuestionId } from './country/dialogue.ts';
 import { BUILDING_KINDS, type Building, type BuildingKind } from './country/buildings.ts';
 
 /** Per-cell map state (one of the 200 generated territories). */
@@ -92,12 +94,41 @@ export type ClientMessage =
   | { t: 'local:open' }
   | { t: 'local:close' }
   | { t: 'build'; kind: BuildingKind; i: number; j: number; rot: 0 | 1 }
-  | { t: 'build:cancel'; id: number };
+  | { t: 'build:cancel'; id: number }
+  | { t: 'citizen:ask'; id: number; q: QuestionId }
+  | { t: 'citizen:release'; id: number }
+  | { t: 'citizen:exile'; id: number };
+
+/** The governor's own nation in full (never sent to anyone else). */
+export interface MyNation {
+  id: number;
+  taxRate: number;
+  food: number;
+  services: Services;
+  announcement: { id: string; until: number } | null;
+  history: NationHistory;
+  /** consecutive ticks at or below the overthrow threshold */
+  lowSatTicks: number;
+}
 
 /** Private country-view data, sent only to the nation's own governors. */
 export interface LocalStateMsg {
   nationId: number;
   buildings: Building[];
+  citizens: Citizen[];
+  stats: TownStats;
+  news: NewsItem[];
+  nation: MyNation;
+}
+
+/** Changes to the private country-view data (null = unchanged). */
+export interface LocalDiff {
+  buildings: Building[];
+  removed: number[];
+  citizens: Citizen[] | null;
+  stats: TownStats | null;
+  nation: MyNation | null;
+  news: NewsItem[];
 }
 
 // ---- server -> client ----
@@ -122,8 +153,10 @@ export type ServerMessage =
   | { t: 'away'; summary: AwaySummary }
   | { t: 'log'; entries: LogEntry[] }
   | { t: 'local:state'; state: LocalStateMsg; now: number }
-  | { t: 'local:diff'; nationId: number; buildings: Building[]; removed: number[]; now: number }
+  | { t: 'local:diff'; nationId: number; diff: LocalDiff; now: number }
   | { t: 'build:result'; ok: boolean; message: string; buildingId: number | null }
+  | { t: 'citizen:answer'; id: number; q: QuestionId; text: string }
+  | { t: 'action:result'; ok: boolean; message: string }
   | { t: 'error'; code: ErrorCode; message: string }
   | { t: 'pong' };
 
@@ -207,6 +240,16 @@ export function parseClientMessage(raw: string): ClientMessage | null {
     case 'build:cancel':
       if (!hasExactKeys(v, ['t', 'id']) || !isId(v.id)) return null;
       return { t: 'build:cancel', id: v.id };
+    case 'citizen:ask':
+      // preset questions only: anything that is not a known question id is rejected
+      if (!hasExactKeys(v, ['t', 'id', 'q']) || !isId(v.id) || typeof v.q !== 'string' || !(QUESTION_IDS as readonly string[]).includes(v.q)) return null;
+      return { t: 'citizen:ask', id: v.id, q: v.q as QuestionId };
+    case 'citizen:release':
+      if (!hasExactKeys(v, ['t', 'id']) || !isId(v.id)) return null;
+      return { t: 'citizen:release', id: v.id };
+    case 'citizen:exile':
+      if (!hasExactKeys(v, ['t', 'id']) || !isId(v.id)) return null;
+      return { t: 'citizen:exile', id: v.id };
     default:
       return null;
   }

@@ -301,6 +301,71 @@ const SCENARIOS = {
     await shot(page, 'cv2-06-completed');
     await dora.close();
   },
+
+  /** Country View CV3: citizens walk by day and sleep at night; the Citizen Card answers preset questions. */
+  async cv3() {
+    await startServer();
+    const eve = await profile('eve', [1280, 720]);
+    const page = await eve.open();
+    await joinViaUi(page, 'Eve');
+    const until = (fn, arg, timeout = 120000) => page.waitForFunction(fn, arg, { timeout, polling: 200 });
+    await page.evaluate(() => window.__wt.enterCountry());
+    await step('enter', () => until(() => window.__wt.country().inside && !window.__wt.country().busy));
+    await step('featured citizens arrive', () => until(() => window.__wt.citizens().length >= 40));
+
+    // daytime: everyone is out
+    await page.evaluate(() => window.__wt.setHour(10.5));
+    await page.evaluate(() => window.__wt.countryOrbit(30, 55, 52));
+    await page.waitForTimeout(1500);
+    const day = await page.evaluate(() => window.__wt.crowd());
+    check(day.agents >= 150, `daytime crowd: ${day.agents} citizens visible`);
+    await shot(page, 'cv3-01-day');
+
+    // night: most go home and windows glow
+    await page.evaluate(() => window.__wt.setHour(23.5));
+    await page.waitForTimeout(1500);
+    const night = await page.evaluate(() => window.__wt.crowd());
+    check(night.agents < day.agents * 0.3, `at night most are home (${night.agents} still out)`);
+    await shot(page, 'cv3-02-night');
+
+    // a featured citizen: hover shows the name tag, click opens the card
+    await page.evaluate(() => window.__wt.setHour(10.5));
+    await page.evaluate(() => window.__wt.countryOrbit(30, 50, 30));
+    await page.waitForTimeout(1200);
+    const target = await page.evaluate(() => {
+      for (const c of window.__wt.citizens()) {
+        const s = window.__wt.citizenScreen(c.id);
+        if (s) return { id: c.id, name: c.name, ...s };
+      }
+      return null;
+    });
+    if (target) {
+      await page.mouse.move(target.x, target.y);
+      await page.waitForTimeout(600);
+      const tag = await page.evaluate(() => document.querySelector('.cv-nametag:not([hidden])')?.textContent ?? null);
+      console.log(`  hover name tag: ${tag}`);
+      await shot(page, 'cv3-03-hover-name-tag');
+      await page.mouse.click(target.x, target.y);
+      await page.waitForTimeout(400);
+    }
+    if (!(await page.isVisible('#citizen-card'))) {
+      // the figure moved between frames under SwiftShader: open the same citizen directly
+      await page.evaluate((id) => window.__wt.openCitizen(id), target?.id ?? (await page.evaluate(() => window.__wt.citizens()[0].id)));
+    }
+    await step('citizen card opens', () => page.waitForSelector('#citizen-card:not([hidden])', { timeout: 20000 }));
+    const card = await page.textContent('#citizen-card');
+    check(/Income/.test(card) && /Life history/.test(card) && /Opinion of the government/.test(card), 'card shows profile, mood, opinion and history');
+    check((await page.$$('#citizen-card input, #citizen-card textarea')).length === 0, 'no free-text input anywhere');
+    await page.click('#citizen-card [data-q="taxes"]');
+    await step('preset question answered', () => page.waitForSelector('#citizen-card [data-answer="taxes"].shown', { timeout: 20000 }));
+    const answer = await page.textContent('#citizen-card [data-answer="taxes"]');
+    const tax = await page.evaluate(() => window.__wt.net().nations.find((n) => n.id === window.__wt.net().you?.nationId)?.taxRate);
+    check(answer.includes(`${tax}%`), `answer uses the real tax rate (${tax}%): "${answer}"`);
+    await page.click('#citizen-card [data-q="food"]');
+    await page.waitForSelector('#citizen-card [data-answer="food"].shown', { timeout: 20000 });
+    await shot(page, 'cv3-04-citizen-card');
+    await eve.close();
+  },
 };
 
 const wanted = process.argv[2];

@@ -1,10 +1,15 @@
 import { createHash } from 'node:crypto';
 import { generateEarthMeta, type EarthMeta } from '../../shared/earth.ts';
 import { gameHoursToMs, inactivityMs, protectionMs, tickMs, type GameConfig } from '../../shared/config.ts';
-import { cellCapacity, foundNation, simulateUntil } from '../../shared/economy.ts';
+import { foundNation } from '../../shared/economy.ts';
+import { simulateCountryUntil, summarizeTown, townStats, type CountryContext, type CountryEvent } from '../../shared/country/sim.ts';
+import { JUSTICE, generateCitizens, releaseCitizen, type Citizen } from '../../shared/country/citizens.ts';
+import { TemplateBackend, type DialogueBackend, type QuestionId } from '../../shared/country/dialogue.ts';
+import { SIM } from '../../shared/country/config.ts';
+import { deriveSeed, mulberry32 } from '../../shared/rng.ts';
 import { chooseHeir, inactivityDeadline, inheritAssets, isInactiveExpired } from '../../shared/inactivity.ts';
-import type { AwaySnapshot, LogEntry, LostReason, Nation, PlayerRec } from '../../shared/model.ts';
-import type { AwaySummary, ClientConfig, CountryState, EarthCounts, ErrorCode, NationView, You } from '../../shared/protocol.ts';
+import type { AwaySnapshot, LogEntry, LostReason, Nation, NewsItem, PlayerRec, TownStats } from '../../shared/model.ts';
+import type { AwaySummary, ClientConfig, CountryState, EarthCounts, ErrorCode, LocalDiff, LocalStateMsg, MyNation, NationView, You } from '../../shared/protocol.ts';
 import { isValidName, normalizeName } from '../../shared/protocol.ts';
 import { COUNTRY_COUNT, type ResourceName } from '../../shared/resources.ts';
 import type { Rng } from '../../shared/rng.ts';
@@ -28,10 +33,23 @@ export const UPRISING_THRESHOLD = 20;
 
 export type BuildResult = { ok: true; building: Building } | { ok: false; reason: PlacementReason | 'no-country' | 'not-found'; message: string };
 
-export interface LocalState {
-  nationId: number;
-  buildings: Building[];
+export type LocalState = LocalStateMsg;
+
+/** The governor's own nation in full (private: only sent to that nation's governors). */
+export function privateNation(n: Nation): MyNation {
+  return { id: n.id, taxRate: n.taxRate, food: Math.round(n.food), services: n.services, announcement: n.announcement, history: n.history, lowSatTicks: n.lowSatTicks };
 }
+
+interface LocalDirty {
+  changed: Set<number>;
+  removed: Set<number>;
+  citizens: boolean;
+  nation: boolean;
+  news: NewsItem[];
+}
+
+/** Citizens change every tick; send them at most this often per nation. */
+const CITIZEN_SEND_MS = 1500;
 
 export interface GameDeps {
   repo: Repository;
@@ -78,7 +96,6 @@ export class Game {
   readonly meta: EarthMeta;
   readonly seed: number;
   readonly neighbors: number[][];
-  private readonly capacity: number[];
   private readonly connections = new Map<string, number>();
   private readonly botOnline = new Set<string>();
   private queue: Promise<unknown> = Promise.resolve();
@@ -90,9 +107,11 @@ export class Game {
   private pendingLog: LogEntry[] = [];
   private readonly sentCells = new Map<number, string>();
   private readonly sentNations = new Map<number, string>();
-  /** per-nation local changes (buildings), delivered only to that nation's governors */
-  private readonly localDirty = new Map<number, { changed: Set<number>; removed: Set<number> }>();
+  /** per-nation local changes, delivered only to that nation's governors */
+  private readonly localDirty = new Map<number, LocalDirty>();
+  private readonly citizensSentAt = new Map<number, number>();
   private readonly terrain: TerrainCache;
+  private readonly dialogue: DialogueBackend = new TemplateBackend();
   /** private notifications for a player (e.g. their country was lost) */
   onPlayerChanged: ((playerId: string) => void) | null = null;
   onDirty: (() => void) | null = null;
@@ -102,7 +121,6 @@ export class Game {
     this.meta = meta;
     this.seed = meta.seed;
     this.neighbors = neighbors;
-    this.capacity = meta.countries.map(cellCapacity);
     this.terrain = new TerrainCache(meta, deps.terrainSize);
   }
 
@@ -179,6 +197,9 @@ export class Game {
     this.world.apply(cs);
     for (const b of cs.buildings ?? []) this.localFor(b.nationId).changed.add(b.id);
     for (const [id, nid] of removedFrom) if (nid >= 0) this.localFor(nid).removed.add(id);
+    for (const [nid] of cs.citizens ?? []) this.localFor(nid).citizens = true;
+    for (const item of cs.news ?? []) this.localFor(item.nationId).news.push(item);
+    for (const n of cs.nations ?? []) this.localFor(n.id).nation = true;
     for (const [cell] of cs.territory ?? []) this.dirtyCells.add(cell);
     for (const n of cs.nations ?? []) {
       this.dirtyNations.add(n.id);
@@ -197,10 +218,10 @@ export class Game {
     return cs;
   }
 
-  private localFor(nationId: number): { changed: Set<number>; removed: Set<number> } {
+  private localFor(nationId: number): LocalDirty {
     let d = this.localDirty.get(nationId);
     if (!d) {
-      d = { changed: new Set(), removed: new Set() };
+      d = { changed: new Set(), removed: new Set(), citizens: false, nation: false, news: [] };
       this.localDirty.set(nationId, d);
     }
     return d;
@@ -208,20 +229,44 @@ export class Game {
 
   /**
    * Local (private) changes per nation since the last call. The network layer
-   * sends each entry only to that nation's own governors.
+   * sends each entry only to that nation's own governors. Citizens are sent at
+   * most every CITIZEN_SEND_MS; a pending update stays queued until then.
    */
-  drainLocal(): Map<number, { buildings: Building[]; removed: number[] }> {
-    const out = new Map<number, { buildings: Building[]; removed: number[] }>();
+  drainLocal(now = Date.now()): Map<number, LocalDiff> {
+    const out = new Map<number, LocalDiff>();
     for (const [nid, d] of this.localDirty) {
+      const n = this.world.nations.get(nid);
+      if (!n) {
+        this.localDirty.delete(nid);
+        continue;
+      }
       const buildings: Building[] = [];
       for (const id of d.changed) {
         const b = this.world.buildings.get(id);
         if (b) buildings.push(b);
       }
-      out.set(nid, { buildings, removed: [...d.removed] });
+      const sendCitizens = d.citizens && now - (this.citizensSentAt.get(nid) ?? 0) >= CITIZEN_SEND_MS;
+      if (sendCitizens) this.citizensSentAt.set(nid, now);
+      const diff: LocalDiff = {
+        buildings,
+        removed: [...d.removed],
+        citizens: sendCitizens ? this.world.citizens.get(nid) ?? [] : null,
+        stats: d.nation ? n.stats : null,
+        nation: d.nation ? privateNation(n) : null,
+        news: d.news,
+      };
+      if (buildings.length || diff.removed.length || diff.citizens || diff.nation || diff.news.length) out.set(nid, diff);
+      if (d.citizens && !sendCitizens) {
+        // keep only the pending citizens flag
+        this.localDirty.set(nid, { changed: new Set(), removed: new Set(), citizens: true, nation: false, news: [] });
+      } else this.localDirty.delete(nid);
     }
-    this.localDirty.clear();
     return out;
+  }
+
+  /** True if some private update is waiting (e.g. throttled citizens). */
+  get hasPendingLocal(): boolean {
+    return this.localDirty.size > 0;
   }
 
   /** Marks a nation's cells for re-broadcast (online status changed outside a commit). */
@@ -365,17 +410,69 @@ export class Game {
 
   // ------------------------------------------------------------------ helpers
 
-  private capacityOf(c: Changes, nationId: number): number {
-    let cap = 0;
-    for (let cell = 0; cell < COUNTRY_COUNT; cell++) if (c.cellOwner(cell) === nationId) cap += this.capacity[cell];
-    return cap;
+  /** Simulation inputs for a nation (its town, founding population and resources). */
+  private countryContext(c: Changes, n: Nation): { ctx: Omit<CountryContext, 'at'>; buildings: Building[] } {
+    const buildings = c.buildingsOf(n.id);
+    const meta = this.meta.countries[n.homeCell];
+    return { ctx: { cfg: this.cfg, town: summarizeTown(buildings), basePopulation: meta.population, resources: meta.resources }, buildings };
   }
 
-  /** Brings a nation's economy up to `until` in one batch and stages the result. */
-  private catchUp(c: Changes, n: Nation, until: number): Nation {
-    const r = simulateUntil(n, until, { cfg: this.cfg, capacity: this.capacityOf(c, n.id) }, tickMs(this.cfg));
-    if (r.nation.lastTickAt !== n.lastTickAt) c.putNation(r.nation);
-    return r.nation;
+  /** Per-tick RNG for a nation's citizens: depends only on seed, nation and tick time. */
+  private citizenRng = (nationId: number) => (at: number) => mulberry32(deriveSeed(this.seed, `cit:${nationId}:${at}`));
+
+  /**
+   * Brings a nation up to `until` in one batch (economy, town, citizens) and
+   * stages the result. Returns null if the government fell during the batch.
+   */
+  private catchUp(c: Changes, n: Nation, until: number): Nation | null {
+    const { ctx, buildings } = this.countryContext(c, n);
+    const citizens = c.citizensOf(n.id);
+    const sim = simulateCountryUntil({ nation: n, citizens }, until, ctx, buildings, tickMs(this.cfg), this.citizenRng(n.id));
+    if (sim.state.nation.lastTickAt === n.lastTickAt) return n;
+    c.putNation(sim.state.nation);
+    if (citizens.length || sim.state.citizens.length) c.putCitizens(n.id, sim.state.citizens);
+    this.reportCountryEvents(c, sim.state.nation, sim.events);
+    if (sim.overthrownAt !== null) {
+      this.loseNation(c, sim.state.nation, 'overthrow', sim.overthrownAt);
+      return null;
+    }
+    return sim.state.nation;
+  }
+
+  /** Turns simulation events into inbox alerts and factual country news. */
+  private reportCountryEvents(c: Changes, n: Nation, events: { at: number; event: CountryEvent }[]): void {
+    const p = c.player(n.playerId);
+    const protestsAt = new Map<number, number>();
+    for (const { at, event: e } of events) {
+      switch (e.kind) {
+        case 'warning': {
+          const sat = Math.round(e.satisfaction);
+          if (p) c.addInbox(p.id, 'warning', `Satisfaction warning: ${sat}%`, `Satisfaction has fallen to ${sat}% (warning level ${e.stage}%). If it stays at or below ${SIM.overthrowAt}% for ${SIM.overthrowTicks} ticks, the citizens will overthrow the government.`, at);
+          c.addNews(n.id, `Satisfaction fell to ${sat}%`, at);
+          break;
+        }
+        case 'shortage':
+          if (e.on && p) c.addInbox(p.id, 'warning', 'Food shortage', 'The market has run out of food. Build farms or markets to feed the population.', at);
+          c.addNews(n.id, e.on ? 'Food supply is low: the market has run out' : 'Food is back on the market stalls', at);
+          break;
+        case 'citizen': {
+          const ce = e.event;
+          if (ce.kind === 'protest') protestsAt.set(at, (protestsAt.get(at) ?? 0) + 1);
+          else if (ce.kind === 'left') c.addNews(n.id, `${ce.citizen.name} left the country`, at);
+          else if (ce.kind === 'arrived') c.addNews(n.id, `${ce.citizen.name} moved to the country`, at);
+          else if (ce.kind === 'suspect') {
+            c.addNews(n.id, `Police detained ${ce.citizen.name}, who ${ce.citizen.suspect?.reason ?? 'broke the law'}`, at);
+            if (p) c.addInbox(p.id, 'warning', 'A citizen was detained', `${ce.citizen.name} ${ce.citizen.suspect?.reason ?? 'broke the law'}. Decide in the Citizen Card: release or exile.`, at);
+          }
+          break;
+        }
+        case 'overthrow':
+          break;
+      }
+    }
+    for (const [at, count] of protestsAt) {
+      c.addNews(n.id, n.taxRate > 35 ? `${count === 1 ? 'A citizen' : `${count} citizens`} joined protests against the ${n.taxRate}% tax rate` : `${count === 1 ? 'A citizen' : `${count} citizens`} joined protests`, at);
+    }
   }
 
   private freeCellFor(c: Changes): number | null {
@@ -441,11 +538,15 @@ export class Game {
       let n = this.world.nationOfPlayer(p);
       if (n) {
         n = this.catchUp(c, n, now);
-        n = { ...n, lastActiveAt: now };
-        c.putNation(n);
+        if (n) {
+          n = { ...n, lastActiveAt: now };
+          c.putNation(n);
+        }
       }
-      const summary = p.away ? this.summarize(p, p.away, n, now) : null;
-      c.putPlayer({ ...p, lastSeen: now, away: null });
+      // the catch-up may have changed the player (e.g. the country was overthrown meanwhile)
+      const p2 = c.player(p.id) ?? p;
+      const summary = p2.away ? this.summarize(p2, p2.away, n, now) : null;
+      c.putPlayer({ ...p2, lastSeen: now, away: null });
       for (const s of this.world.sessions.values()) if (s.playerId === playerId) c.putSession({ ...s, lastUsedAt: now });
       await this.commit(c);
       this.touchNation(p.nationId);
@@ -476,10 +577,13 @@ export class Game {
     let n = this.world.nationOfPlayer(p);
     if (n) {
       n = this.catchUp(c, n, now);
-      n = { ...n, lastActiveAt: now };
-      c.putNation(n);
+      if (n) {
+        n = { ...n, lastActiveAt: now };
+        c.putNation(n);
+      }
     }
-    c.putPlayer({ ...p, lastSeen: now, away: n ? snapshotOf(n, now) : p.away });
+    const p2 = c.player(p.id) ?? p;
+    c.putPlayer({ ...p2, lastSeen: now, away: n ? snapshotOf(n, now) : p2.away });
     return c;
   }
 
@@ -519,10 +623,23 @@ export class Game {
 
   private addStarterTown(c: Changes, n: Nation, now: number): void {
     const t = this.terrain.get(n.homeCell, this.ownCellsOf(c, n.id));
+    const town: Building[] = [];
     for (const p of planStarterTown(t, t.capital)) {
-      c.putBuilding({ id: c.nextId('building'), nationId: n.id, kind: p.kind, i: p.i, j: p.j, rot: p.rot, status: 'done', startedAt: now, completesAt: now });
+      const b: Building = { id: c.nextId('building'), nationId: n.id, kind: p.kind, i: p.i, j: p.j, rot: p.rot, status: 'done', startedAt: now, completesAt: now };
+      c.putBuilding(b);
+      town.push(b);
     }
+    this.addStarterCitizens(c, n, town, now);
     c.addAudit(SYSTEM, 'starter-town', n.id, `starter town founded at tile ${t.capital.i},${t.capital.j}`);
+  }
+
+  private addStarterCitizens(c: Changes, n: Nation, buildings: readonly Building[], now: number): void {
+    c.putCitizens(n.id, generateCitizens(mulberry32(deriveSeed(this.seed, `citizens:${n.id}`)), buildings, n, now));
+  }
+
+  /** Private aggregates for the country view (computed fresh if no tick has run yet). */
+  private statsOf(c: Changes, n: Nation): TownStats {
+    return n.stats ?? townStats(n, this.countryContext(c, n).ctx);
   }
 
   /**
@@ -535,12 +652,82 @@ export class Game {
       const p = this.world.players.get(playerId);
       const n = p ? this.world.nationOfPlayer(p) : null;
       if (!p || !n) return null;
-      if (this.world.buildingsOf(n.id).length === 0) {
-        const c = new Changes(this.world, this.deps.clock());
-        this.addStarterTown(c, n, this.deps.clock());
+      const now = this.deps.clock();
+      const c = new Changes(this.world, now);
+      if (this.world.buildingsOf(n.id).length === 0) this.addStarterTown(c, n, now);
+      else if (c.citizensOf(n.id).length === 0) this.addStarterCitizens(c, n, this.world.buildingsOf(n.id), now);
+      if (!c.empty) await this.commit(c);
+      const nn = this.world.nations.get(n.id) ?? n;
+      return {
+        nationId: n.id,
+        buildings: this.world.buildingsOf(n.id),
+        citizens: this.world.citizens.get(n.id) ?? [],
+        stats: this.statsOf(new Changes(this.world, now), nn),
+        news: this.world.news.get(n.id) ?? [],
+        nation: privateNation(nn),
+      };
+    });
+  }
+
+  /** Looks up one of the requesting governor's own featured citizens. */
+  private ownCitizen(playerId: string, citizenId: number): { p: PlayerRec; n: Nation; citizen: Citizen } | null {
+    const p = this.world.players.get(playerId);
+    const n = p ? this.world.nationOfPlayer(p) : null;
+    if (!p || !n) return null;
+    const citizen = (this.world.citizens.get(n.id) ?? []).find((x) => x.id === citizenId);
+    return citizen ? { p, n, citizen } : null;
+  }
+
+  /** Answers a preset question from templates and the real current state (no state change). */
+  askCitizen(playerId: string, citizenId: number, question: QuestionId): Promise<string | null> {
+    return this.run(async () => {
+      const own = this.ownCitizen(playerId, citizenId);
+      if (!own) return null;
+      const { n, citizen } = own;
+      const c = new Changes(this.world, this.deps.clock());
+      return this.dialogue.answer({
+        citizen,
+        question,
+        nation: n,
+        stats: this.statsOf(c, n),
+        countryName: this.nationName(n),
+        buildingLabel: (id) => {
+          const b = id === null ? undefined : this.world.buildings.get(id);
+          return b && b.nationId === n.id ? BUILDINGS[b.kind].label.toLowerCase() : null;
+        },
+      });
+    });
+  }
+
+  /** Releases or exiles a detained citizen (documented effects in shared/country/citizens.ts JUSTICE). */
+  judgeCitizen(playerId: string, citizenId: number, verdict: 'release' | 'exile'): Promise<{ ok: boolean; message: string }> {
+    return this.run(async () => {
+      const own = this.ownCitizen(playerId, citizenId);
+      if (!own) return { ok: false, message: 'No such citizen.' };
+      const { p, citizen } = own;
+      if (!citizen.suspect) return { ok: false, message: `${citizen.name} is not detained.` };
+      const now = this.deps.clock();
+      const c = new Changes(this.world, now);
+      const n = this.catchUp(c, own.n, now);
+      if (!n) {
         await this.commit(c);
+        return { ok: false, message: 'Your government has fallen.' };
       }
-      return { nationId: n.id, buildings: this.world.buildingsOf(n.id) };
+      const list = c.citizensOf(n.id);
+      if (verdict === 'release') {
+        const released = releaseCitizen(citizen, now);
+        if (!released) return { ok: false, message: `${citizen.name} is not detained.` };
+        c.putCitizens(n.id, list.map((x) => (x.id === citizen.id ? released : x)));
+        c.putNation({ ...n, satisfaction: Math.min(100, n.satisfaction + JUSTICE.release.satisfaction) });
+        c.addNews(n.id, `The government released ${citizen.name}`, now);
+      } else {
+        c.putCitizens(n.id, list.filter((x) => x.id !== citizen.id));
+        c.putNation({ ...n, satisfaction: Math.max(0, n.satisfaction + JUSTICE.exile.satisfaction) });
+        c.addNews(n.id, `${citizen.name} was exiled from the country`, now);
+      }
+      c.addAudit(p.id, `citizen-${verdict}`, n.id, `${p.name} chose to ${verdict} ${citizen.name} (${citizen.suspect.reason})`);
+      await this.commit(c);
+      return { ok: true, message: verdict === 'release' ? `${citizen.name} was released.` : `${citizen.name} was exiled.` };
     });
   }
 
@@ -554,6 +741,10 @@ export class Game {
       const c = new Changes(this.world, now);
       // bring the treasury up to date first, so the funds check uses current money
       const n = this.catchUp(c, n0, now);
+      if (!n) {
+        await this.commit(c);
+        return { ok: false, reason: 'no-country', message: 'Your government has fallen.' };
+      }
       const t = this.terrain.get(n.homeCell, this.world.cellsOf(n.id));
       const locked = n.satisfaction <= UPRISING_THRESHOLD;
       const v = validatePlacement(t, c.buildingsOf(n.id), kind, i, j, rot, n.funds, { locked });
@@ -582,6 +773,10 @@ export class Game {
       if (!b || b.nationId !== n0.id || b.status !== 'building') return { ok: false, reason: 'not-found', message: 'No such construction site.' };
       const c = new Changes(this.world, now);
       const n = this.catchUp(c, n0, now);
+      if (!n) {
+        await this.commit(c);
+        return { ok: false, reason: 'no-country', message: 'Your government has fallen.' };
+      }
       const refund = Math.round(BUILDINGS[b.kind].cost * CANCEL_REFUND);
       c.putNation({ ...n, funds: n.funds + refund });
       c.removeBuilding(b.id);
@@ -639,12 +834,14 @@ export class Game {
         if (!p) continue;
         const online = this.isOnline(p);
         if (isInactiveExpired(n0, online, p.bot, now, cfg)) {
-          expired.push(this.catchUp(c, n0, inactivityDeadline(n0, cfg)));
+          const caught = this.catchUp(c, n0, inactivityDeadline(n0, cfg));
+          if (caught) expired.push(caught);
           continue;
         }
         const due = Math.floor((now - n0.lastTickAt) / tms);
         if (due < 1 || (!online && !p.bot && due < cfg.sweepEveryTicks)) continue;
         let n = this.catchUp(c, n0, now);
+        if (!n) continue; // overthrown during this batch
         if (online && !p.bot) {
           n = { ...n, lastActiveAt: now };
           c.putNation(n);
@@ -682,13 +879,19 @@ export class Game {
     const cells: number[] = [];
     for (let cell = 0; cell < COUNTRY_COUNT; cell++) if (c.cellOwner(cell) === n.id) cells.push(cell);
     c.removeNation(n.id);
+    const why =
+      reason === 'inactivity'
+        ? `${p?.name ?? 'its governor'} was inactive for ${this.cfg.inactivityGameHours} game hours`
+        : reason === 'overthrow'
+          ? `its citizens overthrew the government after satisfaction stayed at or below ${SIM.overthrowAt}%`
+          : 'it was conquered';
     if (p) {
       c.putPlayer({ ...p, nationId: null, lostReason: reason });
-      c.addInbox(p.id, 'danger', `${name} was lost`, reason === 'inactivity' ? `You were away longer than ${this.cfg.inactivityGameHours} game hours. ${heirText}` : heirText);
+      c.addInbox(p.id, 'danger', `${name} was lost`, `${name} was lost because ${why}. ${heirText}`, now);
       this.onPlayerChanged?.(p.id);
     }
     c.addAudit(SYSTEM, 'lose-country', n.id, `${name} lost (${reason}); cells ${cells.join(',')} freed`);
-    c.addLog('inactivity', `${name} was lost: ${p?.name ?? 'its governor'} was inactive for ${this.cfg.inactivityGameHours} game hours. ${heirText}`, cells);
+    c.addLog(reason === 'overthrow' ? 'overthrow' : 'inactivity', `${name} was lost: ${why}. ${heirText}`, cells);
   }
 
   private summarize(p: PlayerRec, away: AwaySnapshot, n: Nation | null, now: number): AwaySummary {

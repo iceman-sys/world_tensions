@@ -9,6 +9,8 @@ import { renderAwaySummary } from './ui/away.ts';
 import { CountryController } from './country/controller.ts';
 import type { CountryStats } from './country/view.ts';
 import type { Building, BuildingKind } from '../../shared/country/buildings.ts';
+import type { Citizen } from '../../shared/country/citizens.ts';
+import type { NewsItem, TownStats } from '../../shared/model.ts';
 import { deriveSeed, formatSeed, mulberry32, parseSeed, randomSeed } from '../../shared/rng.ts';
 import { DEFAULT_FACE_SIZE } from '../../shared/cube.ts';
 import { isValidName, normalizeName, NAME_MAX, NAME_MIN, type CountryState, type NationView, type You } from '../../shared/protocol.ts';
@@ -36,6 +38,14 @@ declare global {
       countryOrbit: (azimuth: number, polar: number, dist: number) => void;
       pickBuilding: (kind: BuildingKind | null) => void;
       findBuildSpot: (kind: BuildingKind, valid: boolean) => { x: number; y: number; i: number; j: number } | null;
+      setHour: (hour: number | null) => void;
+      citizens: () => Citizen[];
+      localStats: () => TownStats | null;
+      news: () => NewsItem[];
+      citizenScreen: (id: number) => { x: number; y: number } | null;
+      openCitizen: (id: number) => boolean;
+      countryLookAt: (x: number, z: number, dist: number) => void;
+      crowd: () => { agents: number; protesters: number; queue: number };
       local: () => Building[];
       memory: () => { geometries: number; textures: number; programs: number };
       globeDistance: () => number;
@@ -582,7 +592,8 @@ window.setInterval(() => {
       `draw calls ${cs.drawCalls}`,
       `triangles  ${formatInt(cs.triangles)}`,
       `instances  ${formatInt(cs.instances)}`,
-      `citizens   0`,
+      `citizens   ${country.crowdCounts().agents} shown / ${net.citizens.length} featured`,
+      `buildings  ${net.localBuildings.size}`,
       `geometries ${cs.geometries}`,
       `textures   ${cs.textures}`,
       `pixelRatio ${globe.renderer.getPixelRatio()}`,
@@ -691,6 +702,14 @@ if (import.meta.env.DEV || params.has('test')) {
     countryOrbit: (az, polar, dist) => country.setOrbit(az, polar, dist),
     pickBuilding: (kind) => country.pickBuilding(kind),
     findBuildSpot: (kind, valid) => country.findSpot(kind, valid),
+    setHour: (hour) => (country.hourOverride = hour),
+    citizens: () => net.citizens,
+    localStats: () => net.localStats,
+    news: () => net.news,
+    citizenScreen: (id) => country.citizenScreen(id),
+    openCitizen: (id) => country.openCitizen(id),
+    countryLookAt: (x, z, dist) => country.lookAt(x, z, dist),
+    crowd: () => country.crowdCounts(),
     local: () => [...net.localBuildings.values()],
     memory: () => ({ geometries: globe.renderer.info.memory.geometries, textures: globe.renderer.info.memory.textures, programs: globe.renderer.info.programs?.length ?? 0 }),
     globeDistance: () => globe.distance,
