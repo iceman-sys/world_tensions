@@ -6,6 +6,8 @@ import { NetClient, resolveServerUrl, type NetStatus } from './net/net.ts';
 import { OwnerMarkers } from './ui/markers.ts';
 import { $, escapeHtml, formatArea, formatDuration, formatInt, formatMoney, formatPopulation, timeAgo } from './ui/format.ts';
 import { renderAwaySummary } from './ui/away.ts';
+import { CountryController } from './country/controller.ts';
+import type { CountryStats } from './country/view.ts';
 import { deriveSeed, formatSeed, mulberry32, parseSeed, randomSeed } from '../../shared/rng.ts';
 import { DEFAULT_FACE_SIZE } from '../../shared/cube.ts';
 import { isValidName, normalizeName, NAME_MAX, NAME_MIN, type CountryState, type NationView, type You } from '../../shared/protocol.ts';
@@ -27,6 +29,12 @@ declare global {
       neighbors: (id: number) => number[];
       owners: () => (string | null)[];
       net: () => { status: NetStatus; you: You | null; nations: NationView[]; countries: CountryState[] };
+      enterCountry: () => Promise<void>;
+      exitCountry: () => Promise<void>;
+      country: () => { inside: boolean; busy: boolean; stats: CountryStats | null };
+      countryOrbit: (azimuth: number, polar: number, dist: number) => void;
+      memory: () => { geometries: number; textures: number; programs: number };
+      globeDistance: () => number;
     };
   }
 }
@@ -129,6 +137,7 @@ function saveBookmarks(): void {
 // ---------- Earth loading ----------
 async function loadEarth(seed: number, newMode: Mode): Promise<void> {
   const token = ++loadToken;
+  if (country.inCountry) await country.exit();
   loader.classList.remove('done');
   loader.hidden = false;
   loaderText.textContent = `Generating Earth ${formatSeed(seed)}…`;
@@ -178,6 +187,7 @@ function hasCountry(): boolean {
 function updateModeUi(): void {
   const shared = mode === 'shared';
   btnMy.hidden = !(shared && hasCountry());
+  $('btn-enter').hidden = !(shared && hasCountry());
   btnJoin.hidden = shared && hasCountry();
   btnJoin.textContent = shared ? (net.you ? 'Found new country' : 'Join Earth') : net.enabled ? 'Back to shared Earth' : 'Join Earth';
   btnJoin.disabled = !net.enabled;
@@ -280,16 +290,19 @@ function updateProfileStatus(id: number): void {
       status.textContent = text;
       status.classList.toggle('warn', s.lostAt !== null);
       const mine = s.nationId !== null && net.you?.nationId === s.nationId;
+      $('p-enter').hidden = !mine;
       const n = net.nationAt(id);
       const prot = n && n.protectedUntil > now ? ` <span class="pill shield" title="New countries cannot declare war or be attacked">Protected ${formatDuration(n.protectedUntil - now)}</span>` : '';
       owner.innerHTML = `<span class="badge"><span class="dot ${s.online ? 'on' : ''}"></span>${escapeHtml(s.owner)}${s.bot ? ' <span class="muted">(bot)</span>' : ''}${mine ? ' <span class="muted">(you)</span>' : ''}</span>${prot}`;
     } else {
+      $('p-enter').hidden = true;
       dot.classList.remove('on');
       status.classList.remove('warn');
       status.textContent = 'Unclaimed';
       owner.innerHTML = '<span class="muted">Unclaimed. Join to be assigned a random country.</span>';
     }
   } else {
+    $('p-enter').hidden = true;
     const on = mockOnline[id];
     dot.classList.toggle('on', on);
     status.textContent = on ? 'Online (mock)' : 'Offline (mock)';
@@ -440,12 +453,38 @@ searchInput.addEventListener('keydown', (e) => {
   }
 });
 
+// ---------- country view ----------
+const country = new CountryController({
+  globe,
+  net,
+  map: () => map,
+  shared: () => mode === 'shared',
+  flagCanvas: (cell, w, h) => flagCanvas(cell, w, h),
+  toast: (text) => toast(text, 4200),
+  onChange: (inside) => {
+    if (inside && net.you && net.you.countryId >= 0) {
+      $('cv-name').textContent = countryName(net.you.countryId);
+      flagCanvas(net.you.countryId, 54, 36, $('cv-flag') as HTMLCanvasElement);
+    }
+    if (!inside) updateModeUi();
+  },
+});
+$('btn-enter').addEventListener('click', () => void country.enter());
+$('p-enter').addEventListener('click', () => void country.enter());
+$('btn-back').addEventListener('click', () => void country.exit());
+
 // ---------- globe callbacks ----------
 globe.onSelect = (id) => select(id);
 globe.onHover = (id) => {
   stage.title = id >= 0 ? countryName(id) : '';
 };
-globe.onFrame = () => markers.layout(mode === 'shared' ? map : null);
+globe.onFrame = () => {
+  markers.layout(mode === 'shared' ? map : null);
+  if (mode === 'shared') country.checkAutoEnter();
+};
+globe.onDoubleSelect = (id) => {
+  if (mode === 'shared') country.requestEnter(id);
+};
 globe.onLowPerformance = () => {
   if (faceSize <= 512 || !map || params.get('fallback') === 'off') return;
   faceSize = 512;
@@ -513,6 +552,11 @@ window.addEventListener('keydown', (e) => {
   const target = e.target as HTMLElement | null;
   if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || joinDialog.open)) return;
   if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (country.inCountry || country.transitioning) {
+    if (e.key === 'Escape') void country.exit();
+    else if (e.key === 'f' || e.key === 'F') statsEl.hidden = !statsEl.hidden;
+    return;
+  }
   if (e.key === 'Escape') select(-1);
   else if (e.key === 'f' || e.key === 'F') statsEl.hidden = !statsEl.hidden;
   else if (e.key === 'r' || e.key === 'R') globe.resetCamera();
@@ -525,6 +569,21 @@ window.addEventListener('keydown', (e) => {
 // ---------- stats overlay ----------
 window.setInterval(() => {
   if (statsEl.hidden) return;
+  const cs = country.stats();
+  if (cs) {
+    statsEl.textContent = [
+      `COUNTRY VIEW`,
+      `FPS        ${country.fps.toFixed(0)}`,
+      `draw calls ${cs.drawCalls}`,
+      `triangles  ${formatInt(cs.triangles)}`,
+      `instances  ${formatInt(cs.instances)}`,
+      `citizens   0`,
+      `geometries ${cs.geometries}`,
+      `textures   ${cs.textures}`,
+      `pixelRatio ${globe.renderer.getPixelRatio()}`,
+    ].join('\n');
+    return;
+  }
   const info = globe.renderer.info;
   const mb = (globe.textureBytes() / (1024 * 1024)).toFixed(1);
   const l = map?.layout;
@@ -582,6 +641,7 @@ net.onJoined = (you) => {
   select(you.countryId, true);
 };
 net.onYou = (you) => {
+  if (you.countryId < 0 && country.inCountry) void country.exit();
   updateModeUi();
   for (const c of net.countries) markers.update(c, isMine(c.id));
   if (you.countryId < 0 && you.lostReason && !awayDialog.open) toast('Your country was lost. Use "Found new country" to start again.', 6000);
@@ -619,6 +679,12 @@ if (import.meta.env.DEV || params.has('test')) {
     neighbors: (id) => (map ? map.neighbors[id] : []),
     owners: () => net.countries.map((c) => c.owner),
     net: () => ({ status: net.status, you: net.you, nations: [...net.nations.values()], countries: net.countries }),
+    enterCountry: () => country.enter(),
+    exitCountry: () => country.exit(),
+    country: () => ({ inside: country.inCountry, busy: country.transitioning, stats: country.stats() }),
+    countryOrbit: (az, polar, dist) => country.setOrbit(az, polar, dist),
+    memory: () => ({ geometries: globe.renderer.info.memory.geometries, textures: globe.renderer.info.memory.textures, programs: globe.renderer.info.programs?.length ?? 0 }),
+    globeDistance: () => globe.distance,
   };
 }
 

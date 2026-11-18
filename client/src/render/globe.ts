@@ -61,6 +61,9 @@ export class Globe {
   onFrame: ((dt: number) => void) | null = null;
   onLowPerformance: (() => void) | null = null;
   onContextChange: ((lost: boolean) => void) | null = null;
+  onDoubleSelect: ((id: number) => void) | null = null;
+  /** true while another view (the country view) owns the renderer */
+  suspended = false;
 
   private planet: THREE.Mesh<THREE.SphereGeometry, THREE.ShaderMaterial>;
   private atmosphere: THREE.Mesh;
@@ -176,6 +179,7 @@ export class Globe {
     this.canvas.addEventListener('pointerdown', this.handlePointerDown);
     this.canvas.addEventListener('pointerup', this.handlePointerUp);
     this.canvas.addEventListener('pointerleave', this.handlePointerLeave);
+    this.canvas.addEventListener('dblclick', this.handleDoubleClick);
     this.canvas.addEventListener('webglcontextlost', this.handleContextLost);
     this.canvas.addEventListener('webglcontextrestored', this.handleContextRestored);
     window.addEventListener('resize', this.handleResize);
@@ -365,10 +369,43 @@ export class Globe {
   }
 
   start(): void {
-    if (this.running) return;
+    if (this.running || this.suspended) return;
     this.running = true;
     this.lastT = performance.now();
     this.renderer.setAnimationLoop(this.frame);
+  }
+
+  /** Hands the renderer and canvas to another view; the globe stops rendering and listening. */
+  suspend(): void {
+    if (this.suspended) return;
+    this.suspended = true;
+    this.running = false;
+    this.renderer.setAnimationLoop(null);
+    this.controls.enabled = false;
+    this.fly = null;
+    this.setHover(-1);
+    window.clearTimeout(this.resumeTimer);
+  }
+
+  resume(): void {
+    if (!this.suspended) return;
+    this.suspended = false;
+    this.controls.enabled = true;
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, this.quality.pixelRatioCap));
+    this.handleResize();
+    this.perfArmedAt = performance.now() + 4000;
+    this.lowFpsSince = 0;
+    this.start();
+  }
+
+  /** Current camera distance from the planet centre. */
+  get distance(): number {
+    return this.camera.position.length();
+  }
+
+  /** True while a programmatic camera flight is running. */
+  get flying(): boolean {
+    return this.fly !== null;
   }
 
   private frame = (): void => {
@@ -456,6 +493,7 @@ export class Globe {
   }
 
   private handleWheel = (e: WheelEvent): void => {
+    if (this.suspended) return; // let the active view's controls handle it
     e.preventDefault();
     e.stopImmediatePropagation();
     if (this.fly) return;
@@ -496,8 +534,15 @@ export class Globe {
     this.ndc.set(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
   }
 
+  private handleDoubleClick = (e: MouseEvent): void => {
+    if (this.suspended || !this.onDoubleSelect) return;
+    const rect = this.canvas.getBoundingClientRect();
+    this.ndc.set(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
+    this.onDoubleSelect(this.pickAtNdc(this.ndc.x, this.ndc.y));
+  };
+
   private handlePointerMove = (e: PointerEvent): void => {
-    if (e.pointerType === 'touch') return; // no hover on touch
+    if (this.suspended || e.pointerType === 'touch') return; // no hover on touch
     this.setNdcFromEvent(e);
     this.pointerInside = true;
     this.pointerDirty = true;
@@ -515,6 +560,7 @@ export class Globe {
   };
 
   private handlePointerUp = (e: PointerEvent): void => {
+    if (this.suspended) return;
     const moved = Math.hypot(e.clientX - this.downX, e.clientY - this.downY);
     if (moved > 6 || performance.now() - this.downT > 600 || e.button !== 0) return;
     this.setNdcFromEvent(e);
@@ -524,7 +570,7 @@ export class Globe {
 
   private handleResize = (): void => {
     const parent = this.canvas.parentElement;
-    if (!parent) return;
+    if (!parent || this.suspended) return;
     const w = parent.clientWidth;
     const h = parent.clientHeight;
     this.camera.aspect = w / Math.max(1, h);
@@ -546,7 +592,7 @@ export class Globe {
     if (this.countryTex) this.countryTex.needsUpdate = true;
     if (this.flagTex) this.flagTex.needsUpdate = true;
     this.onContextChange?.(false);
-    this.start();
+    this.start(); // no-op while suspended; resume() restarts the loop
   };
 
   /** Dev/test hook: place the camera at latitude/longitude (degrees) and distance. */

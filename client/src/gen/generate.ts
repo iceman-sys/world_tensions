@@ -4,6 +4,7 @@ import { colorCountries } from '../../../shared/palette.ts';
 import { deriveSeed, mulberry32 } from '../../../shared/rng.ts';
 import { PLANET_RADIUS_KM } from '../../../shared/resources.ts';
 import type { FaceRaster } from '../../../shared/raster.ts';
+import type { LocalTerrain, TerrainInput } from '../../../shared/country/terrain.ts';
 import type { WorkerRequest, WorkerResponse } from './worker.ts';
 
 export interface EarthMap {
@@ -83,6 +84,13 @@ function getPool(): WorkerPool {
     pool = new WorkerPool(Math.max(2, Math.min(6, cores - 1)));
   }
   return pool;
+}
+
+/** Generates a nation's local terrain in a worker (deterministic; same result as the server). */
+export async function generateTerrain(input: TerrainInput): Promise<LocalTerrain> {
+  const msg = await getPool().run({ type: 'terrain', input });
+  if (msg.type !== 'terrain') throw new Error('unexpected worker reply');
+  return msg.terrain;
 }
 
 /**

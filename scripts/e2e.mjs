@@ -171,6 +171,78 @@ const SCENARIOS = {
     await alice.close();
     await bob.close();
   },
+
+  /** Country View CV1: transition, terrain from several angles, entry rules, no leaks. */
+  async cv1() {
+    await startServer();
+    const carla = await profile('carla', [1280, 720]);
+    const page = await carla.open();
+    const you = await joinViaUi(page, 'Carla');
+    await page.waitForTimeout(1500);
+    const until = (fn, arg, timeout = 120000) => page.waitForFunction(fn, arg, { timeout, polling: 200 });
+    const inside = () => until(() => window.__wt.country().inside && !window.__wt.country().busy);
+    const outside = () => until(() => !window.__wt.country().inside && !window.__wt.country().busy);
+
+    await page.evaluate((id) => window.__wt.select(id, true), you.countryId);
+    await page.waitForTimeout(1800);
+    check(await page.isVisible('#p-enter'), 'own profile offers "Enter country view"');
+    await shot(page, 'cv1-01-globe-own-country');
+    const baseline = await page.evaluate(() => window.__wt.memory());
+
+    // other countries cannot be entered (double-click on a neighbour)
+    const other = await page.evaluate((id) => window.__wt.neighbors(id).find((n) => true), you.countryId);
+    if (other !== undefined) {
+      await page.evaluate((id) => window.__wt.select(id, false), other);
+      check(!(await page.isVisible('#p-enter')), 'a neighbour\'s profile has no enter button');
+    }
+
+    // button entry with a mid-transition frame
+    await page.click('#btn-enter');
+    await page.waitForTimeout(550);
+    await page.screenshot({ path: `${OUT}/cv1-02-transition.png` });
+    console.log(`  saved ${OUT}/cv1-02-transition.png`);
+    await step('enter via button', inside);
+    const stats = await page.evaluate(() => window.__wt.country().stats);
+    check(stats.drawCalls > 0 && stats.instances > 100, `country scene renders (${stats.drawCalls} draw calls, ${stats.instances} instances, ${stats.triangles} triangles)`);
+    await shot(page, 'cv1-03-terrain-capital');
+    for (const [name, az, polar, dist] of [['cv1-04-overview', 0, 12, 230], ['cv1-05-low-angle', 140, 72, 75], ['cv1-06-side', 260, 55, 140]]) {
+      await page.evaluate(([a, p, d]) => window.__wt.countryOrbit(a, p, d), [az, polar, dist]);
+      await shot(page, name);
+    }
+
+    await page.keyboard.press('Escape');
+    await step('Esc returns to the globe', outside);
+    await shot(page, 'cv1-07-back-on-globe');
+
+    // auto-enter: zoom the globe right onto the own country
+    const c = await page.evaluate((id) => window.__wt.centroid(id), you.countryId);
+    const lat = (Math.asin(c[1]) * 180) / Math.PI;
+    const lon = (Math.atan2(c[0], c[2]) * 180) / Math.PI;
+    await page.evaluate(([la, lo]) => window.__wt.setView(la, lo, 1.5), [lat, lon]);
+    await page.waitForTimeout(300);
+    await page.evaluate(([la, lo]) => window.__wt.setView(la, lo, 1.15), [lat, lon]);
+    await step('zooming in close enters automatically', inside);
+    check(true, 'auto-enter on zoom works');
+    await page.evaluate(() => window.__wt.exitCountry());
+    await outside();
+
+    // leak check: after the first visit (three.js creates a few one-time shared resources),
+    // repeated enter/exit must return GPU memory to exactly the same numbers
+    const firstVisit = await page.evaluate(() => window.__wt.memory());
+    console.log(`  globe only: ${JSON.stringify(baseline)}, after first visits: ${JSON.stringify(firstVisit)}`);
+    for (let i = 0; i < 5; i++) {
+      await page.evaluate(() => window.__wt.enterCountry());
+      await inside();
+      await page.evaluate(() => window.__wt.exitCountry());
+      await outside();
+    }
+    const after = await page.evaluate(() => window.__wt.memory());
+    check(
+      after.geometries === firstVisit.geometries && after.textures === firstVisit.textures && after.geometries === baseline.geometries,
+      `no GPU leaks over 5 more enter/exit cycles (geometries ${firstVisit.geometries} -> ${after.geometries}, textures ${firstVisit.textures} -> ${after.textures})`,
+    );
+    await carla.close();
+  },
 };
 
 const wanted = process.argv[2];
