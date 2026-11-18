@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="description" content="World Tensions globe prototype: a procedural planet with 200 fictional countries." />
+    <meta name="theme-color" content="#03060d" />
+    <title>World Tensions — Globe Prototype</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%232f9ad8'/%3E%3Cpath d='M6 12c6 2 8-4 14-2s6 6 6 6M5 20c5-2 9 3 15 1' stroke='%23f0c233' stroke-width='2.5' fill='none'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div id="app">
+      <div id="stage" class="stage"></div>
+
+      <header class="topbar glass" role="banner">
+        <div class="brand" aria-label="World Tensions">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span class="brand-text">WORLD TENSIONS</span>
+        </div>
+
+        <div class="search" role="search">
+          <label class="sr-only" for="search-input">Search countries</label>
+          <input id="search-input" type="search" placeholder="Search countries…" autocomplete="off" spellcheck="false"
+            role="combobox" aria-expanded="false" aria-controls="search-list" aria-autocomplete="list" />
+          <ul id="search-list" class="search-list glass" role="listbox" hidden></ul>
+        </div>
+
+        <div class="top-actions">
+          <button id="seed-chip" class="chip" type="button" aria-label="Copy Earth seed" title="Earth seed (click to copy)">
+            <span class="chip-label">Seed</span><span id="seed-value">--------</span>
+          </button>
+          <button id="btn-new-earth" class="btn" type="button" aria-label="Generate a new local Earth">New Earth</button>
+          <button id="btn-my-country" class="btn" type="button" aria-label="Fly to my country" hidden>My country</button>
+          <button id="btn-join" class="btn btn-primary" type="button" aria-label="Join the shared Earth">Join Earth</button>
+        </div>
+      </header>
+
+      <div id="banner" class="banner" role="status" aria-live="polite" hidden></div>
+
+      <aside class="sidebar" aria-label="Earth overview">
+        <section class="glass card" aria-labelledby="dash-title">
+          <h2 id="dash-title" class="card-title">Earth dashboard <span id="net-dot" class="net-dot" title="Server connection"></span></h2>
+          <dl class="dash">
+            <div><dt>Country slots</dt><dd><span id="d-slots">0</span><span class="muted">/200</span></dd></div>
+            <div><dt>Online</dt><dd id="d-online">0</dd></div>
+            <div><dt>Offline</dt><dd id="d-offline">0</dd></div>
+            <div><dt>Defeated / deleted</dt><dd id="d-defeated">0</dd></div>
+          </dl>
+          <div class="slot-bar" aria-hidden="true"><span id="d-slot-fill"></span></div>
+        </section>
+
+        <section class="glass card" aria-labelledby="bm-title">
+          <h2 id="bm-title" class="card-title">Bookmarks</h2>
+          <ul id="bookmark-list" class="bookmark-list"></ul>
+          <p id="bookmark-empty" class="muted small">Star a country to pin it here.</p>
+        </section>
+
+        <section class="glass card legend" aria-labelledby="legend-title">
+          <h2 id="legend-title" class="card-title">Controls</h2>
+          <ul class="small">
+            <li><b>Drag</b> rotate · <b>Scroll / pinch</b> zoom</li>
+            <li><b>Hover</b> highlight · <b>Click</b> select</li>
+            <li><kbd>Esc</kbd> deselect · <kbd>R</kbd> reset · <kbd>F</kbd> stats</li>
+          </ul>
+          <label id="bots-row" class="toggle small" hidden>
+            <input id="bots-toggle" type="checkbox" /> Simulate bots <span class="muted">(dev)</span>
+          </label>
+        </section>
+      </aside>
+
+      <aside id="profile" class="profile glass" aria-label="Country profile" hidden tabindex="-1">
+        <button id="profile-close" class="icon-btn close" type="button" aria-label="Close country profile">✕</button>
+        <div class="profile-head">
+          <canvas id="profile-flag" width="180" height="120" aria-label="Country flag"></canvas>
+          <div>
+            <h2 id="p-name" class="p-name">—</h2>
+            <div class="p-status"><span id="p-dot" class="dot"></span><span id="p-status">—</span></div>
+          </div>
+          <button id="p-bookmark" class="icon-btn star" type="button" aria-pressed="false" aria-label="Bookmark country">☆</button>
+        </div>
+        <div class="p-owner"><span class="muted">Owner</span> <span id="p-owner">—</span></div>
+        <dl class="stats">
+          <div><dt>Population</dt><dd id="p-pop">—</dd></div>
+          <div><dt>Land area</dt><dd id="p-area">—</dd></div>
+          <div><dt>Satisfaction</dt><dd><span id="p-sat">—</span><span class="meter"><span id="p-sat-bar"></span></span></dd></div>
+          <div><dt>National funds</dt><dd id="p-funds">—</dd></div>
+          <div><dt>Military size</dt><dd id="p-mil-size">—</dd></div>
+          <div><dt>Military strength</dt><dd id="p-mil-str">—</dd></div>
+        </dl>
+        <h3 class="p-sub">Natural resources</h3>
+        <ul id="p-resources" class="tags"></ul>
+        <h3 class="p-sub">Allies · Rivals</h3>
+        <p class="muted small">No alliances or rivalries yet.</p>
+        <h3 class="p-sub">Neighbors <span id="p-ncount" class="muted"></span></h3>
+        <ul id="p-neighbors" class="neighbors"></ul>
+      </aside>
+
+      <div id="markers" class="markers" aria-hidden="true"></div>
+
+      <div id="stats" class="stats-overlay glass" hidden aria-live="off"></div>
+
+      <div id="loader" class="loader" role="progressbar" aria-label="Generating Earth" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div class="loader-inner">
+          <div class="loader-title">WORLD TENSIONS</div>
+          <div id="loader-text" class="loader-text">Generating Earth…</div>
+          <div class="loader-bar"><span id="loader-fill"></span></div>
+        </div>
+      </div>
+
+      <dialog id="join-dialog" class="glass dialog" aria-labelledby="join-title">
+        <form method="dialog" id="join-form">
+          <h2 id="join-title">Join the shared Earth</h2>
+          <p class="muted small">The server assigns you a random unclaimed country. You can't choose where you start.</p>
+          <label for="join-name">Governor name</label>
+          <input id="join-name" name="name" maxlength="20" minlength="2" required autocomplete="nickname" />
+          <p id="join-error" class="error small" role="alert"></p>
+          <div class="dialog-actions">
+            <button type="button" class="btn" id="join-cancel">Cancel</button>
+            <button type="submit" class="btn btn-primary" id="join-submit">Join</button>
+          </div>
+        </form>
+      </dialog>
+
+      <div id="toast" class="toast glass" role="status" aria-live="polite" hidden></div>
+
+      <footer class="footer">Prototype by Charlee Shane</footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
