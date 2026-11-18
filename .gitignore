@@ -1,0 +1,8 @@
+node_modules/
+dist/
+server/data/
+screenshots/
+*.log
+.DS_Store
+.vite/
+World_Tensions_Developer_Design_Document.pdf
