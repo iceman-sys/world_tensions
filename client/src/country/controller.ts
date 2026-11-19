@@ -8,6 +8,8 @@ import { BUILDINGS, constructionMs, type BuildingKind } from '../../../shared/co
 import { CountryView, type CountryStats } from './view.ts';
 import { BuildMenu } from './buildMenu.ts';
 import { CitizenCard } from './citizenCard.ts';
+import { GovPanel, unrestStage } from './govPanel.ts';
+import { NewsTicker } from './newsTicker.ts';
 import { placementText, type PlacementHint } from './placement.ts';
 import { formatMoney } from '../ui/format.ts';
 
@@ -49,6 +51,9 @@ export class CountryController {
   private readonly hint: HTMLElement;
   private menu: BuildMenu | null = null;
   private readonly card: CitizenCard;
+  private panel: GovPanel | null = null;
+  private readonly ticker = new NewsTicker(document.getElementById('news-ticker') as HTMLElement);
+  private readonly unrest = document.getElementById('unrest-overlay') as HTMLElement;
   /** test/dev override of the hour of day (null = follow the server's game clock) */
   hourOverride: number | null = null;
 
@@ -68,7 +73,13 @@ export class CountryController {
       this.refreshCrowd();
       this.card.update(net.citizens);
     };
-    net.onLocalStats = () => this.refreshCrowd();
+    net.onLocalStats = () => {
+      this.refreshCrowd();
+      this.refreshPanel();
+    };
+    net.onNews = () => this.ticker.render(net.news);
+    net.onInbox = () => this.panel?.setInbox(net.inbox);
+    net.onConfig = () => this.refreshPanel();
     net.onAnswer = (id, q, text) => this.card.answer(id, q, text);
     net.onActionResult = (_ok, message) => deps.toast(message);
     net.onBuildResult = (ok, message) => {
@@ -93,12 +104,19 @@ export class CountryController {
     });
   }
 
+  /** Government panel + unrest effect from the server's numbers. */
+  private refreshPanel(): void {
+    const { net } = this.deps;
+    const pub = net.myNation();
+    this.panel?.update(pub, net.myNationPrivate, net.localStats, (net.config?.timeScale ?? 60) >= 3600, net.serverNow());
+    const stage = pub ? unrestStage(pub.satisfaction) : 0;
+    this.unrest.dataset.stage = String(this.view ? stage : 0);
+  }
+
   /** Hour of the game day from the server clock (DEMO_MODE: one game day = 24 real minutes). */
   gameHour(): number {
     if (this.hourOverride !== null) return this.hourOverride;
-    const scale = this.deps.net.config?.timeScale ?? 1;
-    const gameMs = this.deps.net.serverNow() * scale;
-    return (gameMs / 3_600_000) % 24;
+    return (this.deps.net.gameTime() / 3_600_000) % 24;
   }
 
   /** Real milliseconds a construction takes on this server. */
@@ -149,6 +167,7 @@ export class CountryController {
     this.view?.placement?.refresh();
     const el = document.getElementById('cv-funds');
     if (el) el.textContent = formatMoney(f);
+    this.refreshPanel();
   }
 
   get inCountry(): boolean {
@@ -248,6 +267,23 @@ export class CountryController {
         this.menu = new BuildMenu(menuRoot, tip, (k) => this.buildMs(k));
         this.menu.onSelect = (k) => view.startPlacement(k);
       }
+      const panelRoot = document.getElementById('gov-panel');
+      if (panelRoot) {
+        const net = this.deps.net;
+        this.panel = new GovPanel(panelRoot, {
+          setTax: (r) => net.setTax(r),
+          setServices: (s) => net.setServices(s),
+          announce: (id) => net.announce(id),
+          setTimeScale: net.devTools ? (s) => net.setTimeScale(s) : null,
+          // the scenario only uses normal intents: a sharp tax rise (and demo speed on dev servers)
+          scenario: () => {
+            net.setTax(60);
+            if (net.devTools && (net.config?.timeScale ?? 60) < 3600) net.setTimeScale(3600);
+          },
+        });
+        this.panel.setInbox(net.inbox);
+      }
+      this.ticker.render(this.deps.net.news);
       this.refreshFunds();
       document.body.classList.add('in-country');
       this.deps.onChange(true);
@@ -274,6 +310,8 @@ export class CountryController {
     this.menu = null;
     this.hint.hidden = true;
     if (this.card.open) this.card.close();
+    this.panel = null;
+    this.unrest.dataset.stage = '0';
     this.deps.net.closeLocal();
     this.view.dispose(globe.canvas);
     this.view = null;

@@ -1,14 +1,14 @@
 import { createHash } from 'node:crypto';
 import { generateEarthMeta, type EarthMeta } from '../../shared/earth.ts';
 import { gameHoursToMs, inactivityMs, protectionMs, tickMs, type GameConfig } from '../../shared/config.ts';
-import { foundNation } from '../../shared/economy.ts';
-import { simulateCountryUntil, summarizeTown, townStats, type CountryContext, type CountryEvent } from '../../shared/country/sim.ts';
+import { ECONOMY, foundNation } from '../../shared/economy.ts';
+import { ANNOUNCEMENTS, simulateCountryUntil, summarizeTown, townStats, type CountryContext, type CountryEvent } from '../../shared/country/sim.ts';
 import { JUSTICE, generateCitizens, releaseCitizen, type Citizen } from '../../shared/country/citizens.ts';
 import { TemplateBackend, type DialogueBackend, type QuestionId } from '../../shared/country/dialogue.ts';
 import { SIM } from '../../shared/country/config.ts';
 import { deriveSeed, mulberry32 } from '../../shared/rng.ts';
 import { chooseHeir, inactivityDeadline, inheritAssets, isInactiveExpired } from '../../shared/inactivity.ts';
-import type { AwaySnapshot, LogEntry, LostReason, Nation, NewsItem, PlayerRec, TownStats } from '../../shared/model.ts';
+import type { AwaySnapshot, InboxItem, LogEntry, LostReason, Nation, NewsItem, PlayerRec, Services, TownStats } from '../../shared/model.ts';
 import type { AwaySummary, ClientConfig, CountryState, EarthCounts, ErrorCode, LocalDiff, LocalStateMsg, MyNation, NationView, You } from '../../shared/protocol.ts';
 import { isValidName, normalizeName } from '../../shared/protocol.ts';
 import { COUNTRY_COUNT, type ResourceName } from '../../shared/resources.ts';
@@ -37,7 +37,7 @@ export type LocalState = LocalStateMsg;
 
 /** The governor's own nation in full (private: only sent to that nation's governors). */
 export function privateNation(n: Nation): MyNation {
-  return { id: n.id, taxRate: n.taxRate, food: Math.round(n.food), services: n.services, announcement: n.announcement, history: n.history, lowSatTicks: n.lowSatTicks };
+  return { id: n.id, taxRate: n.taxRate, food: Math.round(n.food), services: n.services, announcement: n.announcement, history: n.history, lowSatTicks: n.lowSatTicks, pending: n.pending };
 }
 
 interface LocalDirty {
@@ -47,6 +47,9 @@ interface LocalDirty {
   nation: boolean;
   news: NewsItem[];
 }
+
+/** Protest news is summarised at most once per this many game hours per country. */
+const PROTEST_NEWS_HOURS = 2;
 
 /** Citizens change every tick; send them at most this often per nation. */
 const CITIZEN_SEND_MS = 1500;
@@ -115,6 +118,11 @@ export class Game {
   /** private notifications for a player (e.g. their country was lost) */
   onPlayerChanged: ((playerId: string) => void) | null = null;
   onDirty: (() => void) | null = null;
+  onConfigChanged: (() => void) | null = null;
+  private clockAnchor = { real: 0, game: 0 };
+  private readonly lastProtestNews = new Map<number, number>();
+  /** inbox items to deliver live, per player */
+  private pendingInbox = new Map<string, InboxItem[]>();
 
   private constructor(private readonly deps: GameDeps, world: World, meta: EarthMeta, neighbors: number[][]) {
     this.world = world;
@@ -197,6 +205,11 @@ export class Game {
     this.world.apply(cs);
     for (const b of cs.buildings ?? []) this.localFor(b.nationId).changed.add(b.id);
     for (const [id, nid] of removedFrom) if (nid >= 0) this.localFor(nid).removed.add(id);
+    for (const m of cs.inbox ?? []) {
+      const list = this.pendingInbox.get(m.playerId) ?? [];
+      list.push(m);
+      this.pendingInbox.set(m.playerId, list);
+    }
     for (const [nid] of cs.citizens ?? []) this.localFor(nid).citizens = true;
     for (const item of cs.news ?? []) this.localFor(item.nationId).news.push(item);
     for (const n of cs.nations ?? []) this.localFor(n.id).nation = true;
@@ -261,6 +274,13 @@ export class Game {
         this.localDirty.set(nid, { changed: new Set(), removed: new Set(), citizens: true, nation: false, news: [] });
       } else this.localDirty.delete(nid);
     }
+    return out;
+  }
+
+  /** New inbox items per player since the last call. */
+  drainInbox(): Map<string, InboxItem[]> {
+    const out = this.pendingInbox;
+    this.pendingInbox = new Map();
     return out;
   }
 
@@ -375,6 +395,8 @@ export class Game {
       protectionMs: protectionMs(cfg),
       warRoundSeconds: cfg.warRoundSeconds,
       constructionFactor: cfg.constructionFactor,
+      clockReal: this.clockAnchor.real,
+      clockGame: this.clockAnchor.game,
     };
   }
 
@@ -470,9 +492,19 @@ export class Game {
           break;
       }
     }
+    // protest news is summarised: at most one item per PROTEST_NEWS_HOURS game hours, with the real count
+    const gap = gameHoursToMs(this.cfg, PROTEST_NEWS_HOURS);
+    let lastAt = this.lastProtestNews.get(n.id) ?? -Infinity;
+    let pendingCount = 0;
     for (const [at, count] of protestsAt) {
-      c.addNews(n.id, n.taxRate > 35 ? `${count === 1 ? 'A citizen' : `${count} citizens`} joined protests against the ${n.taxRate}% tax rate` : `${count === 1 ? 'A citizen' : `${count} citizens`} joined protests`, at);
+      pendingCount += count;
+      if (at - lastAt < gap) continue;
+      const protesting = c.citizensOf(n.id).filter((x) => x.status === 'protesting' || x.status === 'planning to move').length;
+      c.addNews(n.id, n.taxRate > 35 ? `${protesting} of ${c.citizensOf(n.id).length} featured citizens are protesting against the ${n.taxRate}% tax rate` : `${protesting} featured citizens are protesting (${pendingCount} joined recently)`, at);
+      lastAt = at;
+      pendingCount = 0;
     }
+    this.lastProtestNews.set(n.id, lastAt);
   }
 
   private freeCellFor(c: Changes): number | null {
@@ -696,6 +728,88 @@ export class Game {
           return b && b.nationId === n.id ? BUILDINGS[b.kind].label.toLowerCase() : null;
         },
       });
+    });
+  }
+
+  // ------------------------------------------------------------------ government (policies)
+
+  private governed(playerId: string): { p: PlayerRec; n: Nation } | null {
+    const p = this.world.players.get(playerId);
+    const n = p ? this.world.nationOfPlayer(p) : null;
+    return p && n ? { p, n } : null;
+  }
+
+  /** Accepts a new tax rate; it takes effect on the next tick. */
+  setTax(playerId: string, rate: number): Promise<{ ok: boolean; message: string }> {
+    return this.run(async () => {
+      const g = this.governed(playerId);
+      if (!g) return { ok: false, message: 'You do not govern a country.' };
+      if (!Number.isInteger(rate) || rate < ECONOMY.minTaxRate || rate > ECONOMY.maxTaxRate) return { ok: false, message: `Tax must be ${ECONOMY.minTaxRate}-${ECONOMY.maxTaxRate}%.` };
+      const now = this.deps.clock();
+      const c = new Changes(this.world, now);
+      const current = g.n.pending?.taxRate ?? g.n.taxRate;
+      c.putNation({ ...g.n, pending: { ...g.n.pending, taxRate: rate } });
+      c.addAudit(g.p.id, 'policy-tax', g.n.id, `${g.p.name} set the tax rate from ${current}% to ${rate}% (applies next tick)`);
+      if (rate !== current) c.addNews(g.n.id, `The government ${rate > current ? 'raised' : 'cut'} the tax rate to ${rate}%`, now);
+      await this.commit(c);
+      return { ok: true, message: `Tax rate set to ${rate}% from the next tick.` };
+    });
+  }
+
+  /** Funds or stops public services; takes effect on the next tick. */
+  setServices(playerId: string, services: Services): Promise<{ ok: boolean; message: string }> {
+    return this.run(async () => {
+      const g = this.governed(playerId);
+      if (!g) return { ok: false, message: 'You do not govern a country.' };
+      const now = this.deps.clock();
+      const c = new Changes(this.world, now);
+      const before = g.n.pending?.services ?? g.n.services;
+      c.putNation({ ...g.n, pending: { ...g.n.pending, services: { ...services } } });
+      const changes = (Object.keys(services) as (keyof Services)[]).filter((k) => services[k] !== before[k]);
+      c.addAudit(g.p.id, 'policy-services', g.n.id, `${g.p.name} set services: ${changes.map((k) => `${k} ${services[k] ? 'on' : 'off'}`).join(', ') || 'no change'} (applies next tick)`);
+      for (const k of changes) c.addNews(g.n.id, `The government ${services[k] ? 'restored' : 'stopped funding'} ${k === 'police' ? 'police patrols' : k === 'health' ? 'health care' : 'schools'}`, now);
+      await this.commit(c);
+      return { ok: true, message: 'Service funding updated from the next tick.' };
+    });
+  }
+
+  /** Publishes a preset policy announcement (documented effect in ANNOUNCEMENTS). */
+  announce(playerId: string, id: string): Promise<{ ok: boolean; message: string }> {
+    return this.run(async () => {
+      const g = this.governed(playerId);
+      const a = ANNOUNCEMENTS[id];
+      if (!g || !a) return { ok: false, message: g ? 'Unknown announcement.' : 'You do not govern a country.' };
+      const now = this.deps.clock();
+      if (g.n.announcement && g.n.announcement.until > now) return { ok: false, message: 'An announcement is still in effect.' };
+      const c = new Changes(this.world, now);
+      c.putNation({ ...g.n, announcement: { id, until: now + gameHoursToMs(this.cfg, a.hours) } });
+      c.addAudit(g.p.id, 'policy-announce', g.n.id, `${g.p.name} announced: "${a.text}"`);
+      c.addNews(g.n.id, `Government announcement: ${a.text}`, now);
+      await this.commit(c);
+      return { ok: true, message: 'Announcement published.' };
+    });
+  }
+
+  /** Game time (ms) at a real moment; continuous across demo-speed changes. */
+  gameTime(now: number): number {
+    return this.clockAnchor.game + (now - this.clockAnchor.real) * this.cfg.timeScale;
+  }
+
+  /** Dev tool: change how fast game time runs (e.g. 1 s = 1 game hour). */
+  setTimeScale(playerId: string, scale: number): Promise<{ ok: boolean; message: string }> {
+    return this.run(async () => {
+      const p = this.world.players.get(playerId);
+      if (!p) return { ok: false, message: 'Join the Earth first.' };
+      const now = this.deps.clock();
+      // keep the game clock continuous, then switch speed
+      this.clockAnchor = { real: now, game: this.gameTime(now) };
+      const before = this.cfg.timeScale;
+      this.deps.cfg.timeScale = scale;
+      const c = new Changes(this.world, now);
+      c.addAudit(p.id, 'dev-time-scale', p.nationId, `${p.name} changed the time scale from ${before} to ${scale}`);
+      await this.commit(c);
+      this.onConfigChanged?.();
+      return { ok: true, message: scale >= 3600 ? 'Demo speed: 1 s = 1 game hour.' : 'Normal demo speed: 1 s = 1 game minute.' };
     });
   }
 

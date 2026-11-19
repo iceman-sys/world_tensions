@@ -42,13 +42,27 @@ covered by tests in `/tests`. Clients only send intents.
 | Military | generated troops (8,000 – 120,000); readiness = generated strength (18 – 64) |
 | Housing capacity | 1.3 × the cell's generated population (summed over held cells) |
 
-## Economy tick (Milestone 1 core; extended in Milestone 2)
+## Economy tick
 
 Per tick, with `h` = tick length in game hours (5/60):
 
-- **Tax income:** `funds += round(population × $2.40 × taxRate% × h)`
+- **Tax base:** `population × $2.40 × taxRate% × h`, multiplied by (0.5 + 0.5 × employment)
+- **Upkeep:** minus the upkeep of the country's finished buildings (switched-off services cost nothing)
 - **Production:** `stock[r] += production[r] × h` for each natural resource
-- **Population:** `population += round(population × 0.2% × h × (1 − population / capacity))`
+- **Population:** `population += round(population × 0.2% × h × (1 − population / housing capacity))`. Below 25 % satisfaction people emigrate (up to 0.4 % per game hour).
+- **Satisfaction, food, jobs, housing and services:** come from the country's town. The full rules are in **docs/COUNTRY_VIEW.md**.
+
+## Satisfaction warnings and overthrow
+
+- Inbox warnings at **40 %, 30 %, 25 %**, each once, re-armed above 45 %.
+- At or below **20 %** for **36 consecutive ticks** the citizens overthrow the government. The country is lost the same way as by inactivity: its cells are freed, assets go to a random active country, and it is logged and audited. The governor can found a new country.
+- Construction is locked while satisfaction is at or below 20 %.
+
+## Government policies
+
+- The tax rate (0–60 %) and public services are accepted immediately and **applied at the start of the next tick**.
+- Preset announcements take effect immediately for a few game hours.
+- Every policy change writes an audit row with the governor's name.
 
 ## Offline catch-up
 
@@ -88,6 +102,11 @@ Per tick, with `h` = tick length in game hours (5/60):
 
 ## Audit log
 
-Every server action that changes money or ownership writes an `audit_log` row:
-join, rejoin, legacy import, country lost, inheritance, release (dev bots), and
-one summary row per economy tick.
+Every server action that changes money, ownership or policy writes an
+`audit_log` row with the acting governor's id **and name**:
+- join, rejoin, legacy import, starter town
+- build, cancel build, construction complete
+- tax, services, announcement, demo time scale
+- citizen release / exile
+- country lost, inheritance, release (dev bots)
+- one summary row per economy tick

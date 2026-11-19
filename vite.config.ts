@@ -12,6 +12,10 @@ export default defineConfig({
   worker: {
     format: 'es',
   },
+  // pre-bundle everything up front, so the dev server never re-optimizes (and reloads the page) mid-session
+  optimizeDeps: {
+    include: ['three', 'three/addons/controls/OrbitControls.js', 'three/addons/utils/BufferGeometryUtils.js'],
+  },
   server: {
     port: 5173,
     strictPort: true,

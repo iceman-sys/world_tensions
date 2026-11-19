@@ -84,6 +84,9 @@ describe('country-view authorization', () => {
     expect(bState.state.nationId).toBe(bob.you.nationId);
     expect(aState.state.buildings.every((b) => b.nationId === alice.you.nationId)).toBe(true);
     expect(bState.state.buildings.every((b) => b.nationId === bob.you.nationId)).toBe(true);
+    // citizens are private too: the two governors get different, nation-specific lists
+    expect(aState.state.citizens.length).toBe(40);
+    expect(bState.state.citizens.map((c) => c.name)).not.toEqual(aState.state.citizens.map((c) => c.name));
 
     // Alice builds: only Alice's sockets get the local diff
     const t = game.terrainOf(alice.you.nationId ?? -1);
@@ -95,12 +98,14 @@ describe('country-view authorization', () => {
     expect((await alice.c.waitFor('build:result')).ok).toBe(true);
     await alice.c.waitFor('local:diff');
     await settle();
-    // Bob saw nothing private about Alice, ever
+    // Bob saw nothing private about Alice, ever: every private message he got is about his own nation
     for (const m of bob.c.messages) {
-      if (m.t === 'local:diff' || m.t === 'local:state') throw new Error(`Bob received ${m.t}`);
+      if (m.t === 'local:diff') expect(m.nationId).toBe(bob.you.nationId);
+      if (m.t === 'local:state') expect(m.state.nationId).toBe(bob.you.nationId);
+      if (m.t === 'local:diff') for (const b of m.diff.buildings) expect(b.nationId).toBe(bob.you.nationId);
     }
-    const bobSeen = JSON.stringify(bob.c.messages);
-    expect(bobSeen).not.toContain('"kind":"house"');
+    const aliceBuildingIds = new Set(game.world.buildingsOf(alice.you.nationId ?? -1).map((b) => b.id));
+    for (const m of bob.c.messages) if (m.t === 'local:diff') for (const b of m.diff.buildings) expect(aliceBuildingIds.has(b.id)).toBe(false);
     alice.c.close();
     bob.c.close();
   });

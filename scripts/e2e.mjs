@@ -319,6 +319,8 @@ const SCENARIOS = {
     await page.waitForTimeout(1500);
     const day = await page.evaluate(() => window.__wt.crowd());
     check(day.agents >= 150, `daytime crowd: ${day.agents} citizens visible`);
+    const perf = await page.evaluate(() => window.__wt.country().stats);
+    console.log(`  render stats (town view, day): ${perf.drawCalls} draw calls, ${perf.instances} instances, ${perf.triangles} triangles, ${perf.geometries} geometries, ${perf.textures} textures`);
     await shot(page, 'cv3-01-day');
 
     // night: most go home and windows glow
@@ -366,11 +368,57 @@ const SCENARIOS = {
     await shot(page, 'cv3-04-citizen-card');
     await eve.close();
   },
+
+  /** Country View CV4: government panel, tax shock scenario -> warnings, protests, uprising. */
+  async cv4() {
+    await startServer();
+    const finn = await profile('finn', [1280, 720]);
+    const page = await finn.open();
+    await joinViaUi(page, 'Finn');
+    const until = (fn, arg, timeout = 180000) => page.waitForFunction(fn, arg, { timeout, polling: 250 });
+    await page.evaluate(() => window.__wt.enterCountry());
+    await step('enter', () => until(() => window.__wt.country().inside && !window.__wt.country().busy));
+    await step('citizens', () => until(() => window.__wt.citizens().length >= 40));
+    await page.evaluate(() => window.__wt.setHour(12));
+    await page.evaluate(() => window.__wt.countryOrbit(20, 52, 40));
+    await page.waitForTimeout(4000);
+    check(await page.isVisible('#gov-panel'), 'government panel is shown');
+    await shot(page, 'cv4-01-government-panel');
+
+    // the Scenario button: tax to 60% (+ demo speed on a dev server); everything else follows from the simulation
+    await page.click('.gp-scenario');
+    await step('tax applied on the next tick', () => until(() => window.__wt.net().nations.find((n) => n.id === window.__wt.net().you?.nationId)?.taxRate === 60));
+    check(true, 'server applied the 60% tax');
+    await step('first satisfaction warning arrives in the inbox', () => until(() => document.querySelector('.gp-inbox')?.textContent?.includes('Satisfaction warning')));
+    check(true, 'warning alert in the inbox');
+    await step('citizens protest', () => until(() => window.__wt.crowd().protesters > 0));
+    await page.waitForTimeout(2500);
+    const crowd = await page.evaluate(() => window.__wt.crowd());
+    check(crowd.protesters > 0, `${crowd.protesters} protesters gather at the town hall`);
+    const news = await page.evaluate(() => window.__wt.news().map((n) => n.text));
+    check(news.some((t) => /tax rate to 60%/.test(t)), `news states the fact: "${news.find((t) => /60%/.test(t))}"`);
+    await shot(page, 'cv4-02-protest-unrest');
+
+    await step('the government falls', () => until(() => document.querySelector('#uprising-dialog')?.open === true, null, 240000));
+    check(true, 'uprising screen shown');
+    await shot(page, 'cv4-03-uprising');
+    await finn.close();
+  },
 };
+
+/** Loads the client once so Vite finishes dependency optimisation before any scenario runs. */
+async function warmUp() {
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  await page.goto(`${BASE}?seed=1234ABCD&fallback=off`, { waitUntil: 'domcontentloaded', timeout: 120000 });
+  await page.waitForFunction(() => window.__wt?.ready === true, null, { timeout: 180000, polling: 250 });
+  await ctx.close();
+}
 
 const wanted = process.argv[2];
 let failed = false;
 try {
+  await step('warm up the dev server', warmUp);
   for (const [name, run] of Object.entries(SCENARIOS)) {
     if (wanted && name !== wanted) continue;
     console.log(`scenario ${name}`);

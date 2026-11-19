@@ -88,6 +88,8 @@ export interface Nation {
   announcement: { id: string; until: number } | null;
   /** aggregates from the last tick (null until the first tick) */
   stats: TownStats | null;
+  /** policy changes the server accepted; applied at the start of the next tick */
+  pending: { taxRate?: number; services?: Services } | null;
 }
 
 export interface AwaySnapshot {

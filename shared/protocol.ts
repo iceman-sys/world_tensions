@@ -2,6 +2,7 @@
 import type { InboxItem, LogEntry, LostReason, Military, NationHistory, NewsItem, Services, TownStats } from './model.ts';
 import type { Citizen } from './country/citizens.ts';
 import { QUESTION_IDS, type QuestionId } from './country/dialogue.ts';
+import { ANNOUNCEMENTS } from './country/sim.ts';
 import { BUILDING_KINDS, type Building, type BuildingKind } from './country/buildings.ts';
 
 /** Per-cell map state (one of the 200 generated territories). */
@@ -67,6 +68,9 @@ export interface ClientConfig {
   warRoundSeconds: number;
   /** multiplies building construction times */
   constructionFactor: number;
+  /** game clock anchor: game time = clockGame + (serverNow - clockReal) x timeScale */
+  clockReal: number;
+  clockGame: number;
 }
 
 export interface AwaySummary {
@@ -97,7 +101,14 @@ export type ClientMessage =
   | { t: 'build:cancel'; id: number }
   | { t: 'citizen:ask'; id: number; q: QuestionId }
   | { t: 'citizen:release'; id: number }
-  | { t: 'citizen:exile'; id: number };
+  | { t: 'citizen:exile'; id: number }
+  | { t: 'policy:tax'; rate: number }
+  | { t: 'policy:services'; health: boolean; education: boolean; police: boolean }
+  | { t: 'policy:announce'; id: string }
+  | { t: 'dev:timescale'; scale: number };
+
+/** Time scales the dev "Demo speed" switch may choose (1 s = 1 game minute / 1 game hour). */
+export const DEV_TIME_SCALES = [60, 3600] as const;
 
 /** The governor's own nation in full (never sent to anyone else). */
 export interface MyNation {
@@ -109,6 +120,8 @@ export interface MyNation {
   history: NationHistory;
   /** consecutive ticks at or below the overthrow threshold */
   lowSatTicks: number;
+  /** accepted policy changes waiting for the next tick */
+  pending: { taxRate?: number; services?: Services } | null;
 }
 
 /** Private country-view data, sent only to the nation's own governors. */
@@ -146,7 +159,11 @@ export type ServerMessage =
       /** server clock, for countdowns */
       now: number;
       log: LogEntry[];
+      /** your recent inbox (empty for spectators) */
+      inbox: InboxItem[];
     }
+  | { t: 'inbox'; items: InboxItem[] }
+  | { t: 'config'; config: ClientConfig }
   | { t: 'joined'; you: You; token: string }
   | { t: 'you'; you: You }
   | { t: 'diff'; countries: CountryState[]; counts: EarthCounts; nations: NationView[]; removedNations: number[]; now: number }
@@ -250,6 +267,19 @@ export function parseClientMessage(raw: string): ClientMessage | null {
     case 'citizen:exile':
       if (!hasExactKeys(v, ['t', 'id']) || !isId(v.id)) return null;
       return { t: 'citizen:exile', id: v.id };
+    case 'policy:tax':
+      if (!hasExactKeys(v, ['t', 'rate']) || typeof v.rate !== 'number' || !Number.isInteger(v.rate) || v.rate < 0 || v.rate > 60) return null;
+      return { t: 'policy:tax', rate: v.rate };
+    case 'policy:services':
+      if (!hasExactKeys(v, ['t', 'health', 'education', 'police'])) return null;
+      if (typeof v.health !== 'boolean' || typeof v.education !== 'boolean' || typeof v.police !== 'boolean') return null;
+      return { t: 'policy:services', health: v.health, education: v.education, police: v.police };
+    case 'policy:announce':
+      if (!hasExactKeys(v, ['t', 'id']) || typeof v.id !== 'string' || !Object.prototype.hasOwnProperty.call(ANNOUNCEMENTS, v.id)) return null;
+      return { t: 'policy:announce', id: v.id };
+    case 'dev:timescale':
+      if (!hasExactKeys(v, ['t', 'scale']) || !(DEV_TIME_SCALES as readonly unknown[]).includes(v.scale)) return null;
+      return { t: 'dev:timescale', scale: v.scale as number };
     default:
       return null;
   }

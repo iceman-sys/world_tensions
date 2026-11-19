@@ -111,6 +111,19 @@
       </section>
       <nav id="build-menu" class="build-menu glass" aria-label="Build menu"></nav>
       <aside id="citizen-card" class="citizen-card glass" aria-label="Citizen card" hidden></aside>
+      <aside id="gov-panel" class="gov-panel glass" aria-label="Government panel"></aside>
+      <div id="news-ticker" class="news-ticker glass" role="marquee" aria-label="Country news"></div>
+      <div id="unrest-overlay" class="unrest-overlay" data-stage="0" aria-hidden="true"></div>
+      <dialog id="uprising-dialog" class="glass dialog wide" aria-labelledby="uprising-title">
+        <form method="dialog">
+          <h2 id="uprising-title">The citizens have overthrown your government</h2>
+          <p id="uprising-body" class="lost"></p>
+          <div class="dialog-actions">
+            <button type="submit" class="btn" value="close">Look at the globe</button>
+            <button type="submit" class="btn btn-primary" id="uprising-rejoin" value="rejoin">Found a new country</button>
+          </div>
+        </form>
+      </dialog>
       <div id="build-tip" class="build-tip glass" role="tooltip" hidden></div>
       <div id="build-hint" class="build-hint" aria-live="polite" hidden></div>
       <div id="country-fade" class="country-fade" aria-hidden="true"></div>

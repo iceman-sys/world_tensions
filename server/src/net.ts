@@ -85,10 +85,12 @@ export function createGameServer(game: Game, opts: NetOptions): GameServer {
       }
       if (d.log.length) broadcast({ t: 'log', entries: d.log });
       for (const [nationId, diff] of game.drainLocal()) sendToNation(nationId, { t: 'local:diff', nationId, diff, now: Date.now() });
+      for (const [playerId, items] of game.drainInbox()) sendToPlayer(playerId, { t: 'inbox', items });
       // throttled citizen updates still waiting: flush again shortly
       if (game.hasPendingLocal) game.onDirty?.();
     }, 100);
   };
+  game.onConfigChanged = () => broadcast({ t: 'config', config: game.clientConfig() });
   game.onPlayerChanged = (playerId) => {
     // runs inside a commit; send after it has been applied
     setTimeout(() => {
@@ -130,6 +132,7 @@ export function createGameServer(game: Game, opts: NetOptions): GameServer {
           config: game.clientConfig(),
           now: Date.now(),
           log: game.world.log.slice(-60),
+          inbox: p ? (game.world.inbox.get(p.id) ?? []).slice(-30) : [],
         });
         if (summary) send(c, { t: 'away', summary });
         return;
@@ -187,6 +190,26 @@ export function createGameServer(game: Game, opts: NetOptions): GameServer {
         // another nation's citizen is indistinguishable from a missing one
         if (text === null) return send(c, { t: 'action:result', ok: false, message: 'No such citizen.' });
         send(c, { t: 'citizen:answer', id: msg.id, q: msg.q, text });
+        return;
+      }
+      case 'policy:tax':
+      case 'policy:services':
+      case 'policy:announce': {
+        if (!c.playerId) return error(c, 'no-country', 'Join the Earth first.');
+        const r =
+          msg.t === 'policy:tax'
+            ? await game.setTax(c.playerId, msg.rate)
+            : msg.t === 'policy:services'
+              ? await game.setServices(c.playerId, { health: msg.health, education: msg.education, police: msg.police })
+              : await game.announce(c.playerId, msg.id);
+        send(c, { t: 'action:result', ok: r.ok, message: r.message });
+        return;
+      }
+      case 'dev:timescale': {
+        if (!opts.dev) return error(c, 'not-allowed', 'Demo speed is only available on a development server.');
+        if (!c.playerId) return error(c, 'no-country', 'Join the Earth first.');
+        const r = await game.setTimeScale(c.playerId, msg.scale);
+        send(c, { t: 'action:result', ok: r.ok, message: r.message });
         return;
       }
       case 'citizen:release':

@@ -82,6 +82,7 @@ export function foundNation(args: {
     services: { health: true, education: true, police: true },
     announcement: null,
     stats: null,
+    pending: null,
   };
 }
 

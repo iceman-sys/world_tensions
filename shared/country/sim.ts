@@ -149,7 +149,9 @@ export interface CountryState {
 
 /** One tick of the whole country: economy, town aggregates, satisfaction, citizens. */
 export function tickCountry(state: CountryState, ctx: CountryContext, buildings: readonly Building[], rng: Rng): { state: CountryState; events: CountryEvent[] } {
-  const n0 = state.nation;
+  // policy changes accepted since the last tick take effect now
+  const p = state.nation.pending;
+  const n0: Nation = p ? { ...state.nation, taxRate: p.taxRate ?? state.nation.taxRate, services: p.services ?? state.nation.services, pending: null } : state.nation;
   const h = tickHours(ctx.cfg);
   const events: CountryEvent[] = [];
   const before = townStats(n0, ctx);

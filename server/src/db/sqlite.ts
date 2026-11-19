@@ -168,6 +168,7 @@ interface NationExtra {
   services?: Services;
   announcement?: { id: string; until: number } | null;
   stats?: TownStats | null;
+  pending?: { taxRate?: number; services?: Services } | null;
 }
 
 interface PlayerRow { id: string; name: string; bot: number; created_at: number; last_seen: number; country_id: number | null; away: string | null; lost_reason: string | null }
@@ -275,6 +276,7 @@ export class SqliteRepository implements Repository {
         services: extra.services ?? { health: true, education: true, police: true },
         announcement: extra.announcement ?? null,
         stats: extra.stats ?? null,
+        pending: extra.pending ?? null,
       };
     });
 
@@ -411,7 +413,7 @@ export class SqliteRepository implements Repository {
             low_sat_ticks: n.lowSatTicks,
             warn_stage: n.warnStage,
             history: JSON.stringify(n.history),
-            extra: JSON.stringify({ food: n.food, services: n.services, announcement: n.announcement, stats: n.stats } satisfies NationExtra),
+            extra: JSON.stringify({ food: n.food, services: n.services, announcement: n.announcement, stats: n.stats, pending: n.pending } satisfies NationExtra),
           });
           delRes.run(n.id);
           const names = new Set<string>([...Object.keys(n.stock), ...Object.keys(n.production)]);

@@ -657,11 +657,20 @@ net.onJoined = (you) => {
   toast(`Welcome, ${you.name}. You govern ${countryName(you.countryId)}.`, 4500);
   select(you.countryId, true);
 };
+const uprisingDialog = $('uprising-dialog') as HTMLDialogElement;
+uprisingDialog.addEventListener('close', () => {
+  if (uprisingDialog.returnValue === 'rejoin') btnJoin.click();
+});
 net.onYou = (you) => {
   if (you.countryId < 0 && country.inCountry) void country.exit();
+  if (you.countryId < 0 && you.lostReason === 'overthrow' && !uprisingDialog.open) {
+    const last = [...net.inbox].reverse().find((m) => m.kind === 'danger');
+    $('uprising-body').textContent = last?.body ?? 'Satisfaction stayed at or below 20% for too long and the citizens took power.';
+    uprisingDialog.showModal();
+  }
   updateModeUi();
   for (const c of net.countries) markers.update(c, isMine(c.id));
-  if (you.countryId < 0 && you.lostReason && !awayDialog.open) toast('Your country was lost. Use "Found new country" to start again.', 6000);
+  if (you.countryId < 0 && you.lostReason && you.lostReason !== 'overthrow' && !awayDialog.open) toast('Your country was lost. Use "Found new country" to start again.', 6000);
 };
 net.onAway = (summary) => {
   const { period, html } = renderAwaySummary(summary);

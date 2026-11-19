@@ -3,10 +3,11 @@ import type { LogEntry } from '../../../shared/model.ts';
 import type { Building, BuildingKind } from '../../../shared/country/buildings.ts';
 import type { Citizen } from '../../../shared/country/citizens.ts';
 import type { QuestionId } from '../../../shared/country/dialogue.ts';
-import type { NewsItem, TownStats } from '../../../shared/model.ts';
+import type { InboxItem, NewsItem, TownStats } from '../../../shared/model.ts';
 import type { MyNation } from '../../../shared/protocol.ts';
 
 const NEWS_KEEP = 40;
+const INBOX_KEEP = 40;
 import { COUNTRY_COUNT } from '../../../shared/resources.ts';
 
 const emptyCell = (id: number): CountryState => ({ id, owner: null, online: false, lastSeen: 0, bot: false, nationId: null, homeCell: id, lostAt: null });
@@ -74,6 +75,10 @@ export class NetClient {
   onNews: ((items: NewsItem[]) => void) | null = null;
   onAnswer: ((citizenId: number, q: QuestionId, text: string) => void) | null = null;
   onActionResult: ((ok: boolean, message: string) => void) | null = null;
+  /** your inbox (alerts, completed buildings, inheritances...) */
+  inbox: InboxItem[] = [];
+  onInbox: ((items: InboxItem[]) => void) | null = null;
+  onConfig: (() => void) | null = null;
   private wantLocal = false;
 
   private ws: WebSocket | null = null;
@@ -176,6 +181,30 @@ export class NetClient {
     this.send({ t: 'build:cancel', id });
   }
 
+  setTax(rate: number): void {
+    this.send({ t: 'policy:tax', rate });
+  }
+
+  setServices(s: { health: boolean; education: boolean; police: boolean }): void {
+    this.send({ t: 'policy:services', ...s });
+  }
+
+  announce(id: string): void {
+    this.send({ t: 'policy:announce', id });
+  }
+
+  /** Dev servers only: 60 (1 s = 1 game minute) or 3600 (1 s = 1 game hour). */
+  setTimeScale(scale: number): void {
+    this.send({ t: 'dev:timescale', scale });
+  }
+
+  /** Game time in ms on the server's clock (continuous across demo-speed changes). */
+  gameTime(): number {
+    const c = this.config;
+    if (!c) return this.serverNow();
+    return c.clockGame + (this.serverNow() - c.clockReal) * c.timeScale;
+  }
+
   /** Preset questions only: the protocol has no free-text field. */
   ask(citizenId: number, q: QuestionId): void {
     this.send({ t: 'citizen:ask', id: citizenId, q });
@@ -224,6 +253,8 @@ export class NetClient {
         this.neighbors = msg.neighbors;
         this.clockOffset = msg.now - Date.now();
         this.log = msg.log.slice(-LOG_KEEP);
+        this.inbox = msg.inbox.slice(-INBOX_KEEP);
+        this.onInbox?.(this.inbox);
         if (!msg.you) writeToken(null);
         for (let id = 0; id < COUNTRY_COUNT; id++) this.countries[id] = emptyCell(id);
         this.applyCountries(msg.countries);
@@ -279,6 +310,14 @@ export class NetClient {
         break;
       case 'citizen:answer':
         this.onAnswer?.(msg.id, msg.q, msg.text);
+        break;
+      case 'inbox':
+        this.inbox = [...this.inbox, ...msg.items].slice(-INBOX_KEEP);
+        this.onInbox?.(msg.items);
+        break;
+      case 'config':
+        this.config = msg.config;
+        this.onConfig?.();
         break;
       case 'action:result':
         this.onActionResult?.(msg.ok, msg.message);

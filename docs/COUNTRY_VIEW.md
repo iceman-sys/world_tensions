@@ -261,6 +261,42 @@ can implement `DialogueBackend`, but only templates ship.
   - **mood:** at satisfaction ≥ 65, 75 % spend the evening in the park (40 % at ≥ 45, 15 % below)
 - **Performance:** all buffers are preallocated; `update()` does not allocate.
 
+## Government panel and feedback loop (CV4)
+
+| Control | Message | Rule |
+|---|---|---|
+| Tax slider | `policy:tax {rate}` | integer **0–60 %**; stored as *pending* and applied at the start of the **next tick** (also inside a batched catch-up) |
+| Public services | `policy:services {health, education, police}` | switching one off zeroes its coverage (health, education; safety falls back to 0.5) and stops its buildings' upkeep, from the next tick |
+| Announcements | `policy:announce {id}` | preset messages only. One at a time. Each adds a documented bonus to the satisfaction target for a few game hours. |
+| Demo speed (dev servers) | `dev:timescale {scale}` | 60 (1 s = 1 game minute) or 3600 (1 s = 1 game hour). The game clock stays continuous (anchor `clockReal` / `clockGame`). |
+| Scenario | (client) | sends the normal intent `policy:tax 60` (plus demo speed on dev servers); the citizens react within about 30 s |
+
+All of them are audited with the governor's name. Tax and service changes also
+produce a factual news item.
+
+| Announcement | Effect |
+|---|---|
+| "The government thanks every citizen for their hard work." | +2 for 6 game hours |
+| "The government will review taxes next season." | +3 for 6 game hours |
+| "New farms are planned to keep the market stocked." | +2 for 8 game hours |
+| "More patrols will keep neighbourhoods safe." | +2 for 8 game hours |
+
+**Feedback.**
+- **Sparklines:** population, satisfaction, employment and treasury, from the server's per-tick history (last 60 ticks).
+- **Warning stages:** 40 / 30 / 25 % produce inbox alerts (delivered live) and an unrest level in the panel. The scene gets a red vignette that strengthens with each stage, and protest crowds form when citizens protest.
+- **Uprising:** at ≤ 20 % for 36 ticks the government falls and the uprising screen offers "Found a new country".
+
+**Country News** (`news` table, private to the nation). The ticker shows only
+items the server created from simulation events or government actions. Each is
+labelled **FACT**; anything else would be labelled FLAVOR (none ship). Events:
+- tax and service changes, announcements
+- satisfaction warnings
+- food shortage and recovery
+- protests (summarised at most every 2 game hours, with the real count)
+- citizens leaving or arriving
+- detentions, releases and exiles
+- completed buildings (inbox)
+
 ## Server authority
 
 Terrain derives only from public data (the Earth seed), the same as the globe, so
